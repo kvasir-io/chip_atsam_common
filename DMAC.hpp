@@ -237,6 +237,33 @@ namespace DMAC {
         static constexpr auto stop() {
             return stop<Channel, Regs>();
         }
+
+        enum class ChannelEvent : std::uint8_t { none, complete, error };
+
+        /// Reads and clears CHINTFLAG TERR/TCMPL; set even with the interrupt off (DS40001882L
+        /// 20.6.5). Uses CHID on the D21/C21.
+        template<DMAChannel Channel,
+                 typename Regs_t = Regs>
+        static ChannelEvent takeEvent() {
+            static_assert(numberOfChannels > static_cast<std::size_t>(Channel));
+            std::uint8_t flags{};
+            if constexpr(Traits::DmacTraits::OldImpl) {
+                apply(write(
+                  Regs_t::CHID::id,
+                  Kvasir::Register::value<std::uint8_t, static_cast<std::uint8_t>(Channel)>()));
+                flags = static_cast<std::uint8_t>(
+                  get<0>(apply(read(Regs_t::CHINTFLAG::FULLREGISTER))) & 0x03U);
+                if(flags != 0) { apply(write(Regs_t::CHINTFLAG::FULLREGISTER, flags)); }
+            } else {
+                using CHRegs = typename Regs_t::template CHANNEL<static_cast<std::size_t>(Channel)>;
+                flags        = static_cast<std::uint8_t>(
+                  get<0>(apply(read(CHRegs::CHINTFLAG::FULLREGISTER))) & 0x03U);
+                if(flags != 0) { apply(write(CHRegs::CHINTFLAG::FULLREGISTER, flags)); }
+            }
+            if((flags & 0x01U) != 0) { return ChannelEvent::error; }
+            if((flags & 0x02U) != 0) { return ChannelEvent::complete; }
+            return ChannelEvent::none;
+        }
     };
 
 }   // namespace DMAC
