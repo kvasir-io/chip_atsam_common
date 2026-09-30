@@ -14,6 +14,7 @@
 #include <limits>
 #include <span>
 #include <string_view>
+#include <type_traits>
 
 namespace Kvasir { namespace Sercom { namespace I2C {
 
@@ -66,6 +67,25 @@ namespace Kvasir { namespace Sercom { namespace I2C {
         StaticFunction<void(I2CRequestResult), CallbackSize> callback{};
     };
 
+    /// The request of a bus with I2CConfig::perDeviceClock: the device's BAUD ride along.
+    /// A type of its own, not a parameter of I2CRequest, so that a bus without the feature
+    /// keeps the very same type (and names: a sanitize image hashes them).
+    ///
+    /// `BusDefault` is the timing of the bus's own rate: a request nobody gave a timing - the bus
+    /// scan's probes, a raw request of the application's - goes out at baudRate, never at the
+    /// all-zero counts a value-initialised member would be.
+    template<std::size_t CallbackSize, typename Timing, Timing BusDefault>
+    struct I2CTimedRequest : I2CRequest<CallbackSize> {
+        Timing timing{BusDefault};
+    };
+
+    namespace Detail {
+        /// Not constexpr: reaching one in timing() is the compile error that says why.
+        inline void i2cDeviceClockBelowTheBusClockSetPerDeviceClockOnTheBus() {}
+
+        inline void i2cDeviceClockBelowMinBaudRateOfTheBus() {}
+    }   // namespace Detail
+
     template<typename I2CConfig,
              typename Clock,
              std::size_t QueueDepth_   = 8,
@@ -80,9 +100,48 @@ namespace Kvasir { namespace Sercom { namespace I2C {
         using base     = Detail::I2CBase<I2CConfig>;
         using Regs     = typename base::Regs;
         using tp       = typename Clock::time_point;
-        using Request  = I2CRequest<CallbackSize>;
         using Result   = I2CRequestResult;
         using Recovery = Kvasir::I2C::LineRecovery<base, Clock>;
+
+        /// Each device at its own clock (I2CConfig::perDeviceClock). Off, a request has no
+        /// timing member and startNext_() never looks at BAUD: nothing of this is in the image.
+        static constexpr bool PerDeviceClock = base::I2CConfig::perDeviceClock;
+        using ClockTiming                    = Detail::ClockTiming;
+        /// The timing of baudRate itself, what a request without one of its own carries.
+        static constexpr ClockTiming DefaultTiming = [] {
+            if constexpr(PerDeviceClock) {
+                return Detail::clockTiming(I2CConfig::clockSpeed,
+                                           static_cast<std::uint32_t>(BaudRate),
+                                           base::I2CConfig::maxBaudRateError);
+            } else {
+                return ClockTiming{};
+            }
+        }();
+        using Request
+          = std::conditional_t<PerDeviceClock,
+                               I2CTimedRequest<CallbackSize, ClockTiming, DefaultTiming>,
+                               I2CRequest<CallbackSize>>;
+
+        /// What a request carries for a device clocked at most at `hz` (kvasir_devices'
+        /// Device fills it in from Config::BusClock / Chip::I2cMaxClock): BAUD for
+        /// min(hz, baudRate). On a bus without perDeviceClock a device slower than the bus is
+        /// a compile error, and the answer is nothing.
+        static consteval auto timing(std::uint32_t hz) {
+            if constexpr(PerDeviceClock) {
+                auto const f = std::min(hz, static_cast<std::uint32_t>(BaudRate));
+                if(f < base::I2CConfig::minBaudRate) {
+                    Detail::i2cDeviceClockBelowMinBaudRateOfTheBus();
+                }
+                return Detail::clockTiming(I2CConfig::clockSpeed,
+                                           f,
+                                           base::I2CConfig::maxBaudRateError);
+            } else {
+                if(hz < BaudRate) {
+                    Detail::i2cDeviceClockBelowTheBusClockSetPerDeviceClockOnTheBus();
+                }
+                return std::false_type{};
+            }
+        }
 
         /// Bus faults in an unbroken row that mean the bus is dead. A success resets it, and
         /// so does a NAK: the address went out and nobody took it, which is a working wire
@@ -293,6 +352,16 @@ namespace Kvasir { namespace Sercom { namespace I2C {
         /// kind of event, a block that does not follow its own handshake.
         static std::uint32_t disableWaitsExhausted() { return syncWaitsExhausted_; }
 
+        /// Times startNext_() rewrote BAUD for a device at another clock (perDeviceClock only, 0
+        /// without it).
+        static std::uint32_t clockSwitches() {
+            if constexpr(PerDeviceClock) {
+                return clockSwitches_;
+            } else {
+                return 0;
+            }
+        }
+
         static TimeoutSnapshot const& lastTimeout() { return lastTimeout_; }
 
         /// lastTimeout() as a log line (state 1 is sending, 2 receiving; sent/received are
@@ -489,6 +558,38 @@ namespace Kvasir { namespace Sercom { namespace I2C {
             ++syncWaitsExhausted_;
         }
 
+        /// The BAUD (and CTRLA.SPEED) of the request about to start, written only when it
+        /// differs from the last. Both are enable-protected: "writing to these registers will
+        /// be discarded" while CTRLA.ENABLE=1 (SAM D21 DS40001882 28.6.2.1, SAM C21
+        /// DS60001479 33.6.2.1). So the block is disabled for it, after the bus has gone idle
+        /// (the previous transfer's STOP is still on its way out when a success starts the
+        /// next request from its interrupt), and the bus state forced to idle again after the
+        /// enable, which leaves it UNKNOWN (D21 28.6.2.3, C21 33.6.2.3). Interrupt masked or
+        /// in the ISR.
+        static void applyTiming_(ClockTiming const& t) {
+            if(timingValid_ && t == timing_) { return; }
+            for(std::uint32_t spins = 0; spins < 100'000U; ++spins) {
+                if(fieldEquals(Regs::STATUS::BUSSTATEValC::idle)) { break; }
+            }
+            apply(clear(Regs::CTRLA::enable));
+            waitSync_();
+            apply(write(Regs::BAUD::baud, std::uint32_t{t.baud}),
+                  write(Regs::BAUD::baudlow, std::uint32_t{t.baudlow}),
+                  write(Regs::BAUD::hsbaud, std::uint32_t{0}),
+                  write(Regs::BAUD::hsbaudlow, std::uint32_t{0}));
+            if(t.speed == 0) {
+                apply(write(Regs::CTRLA::SPEEDValC::standard_and_fast_mode));
+            } else {
+                apply(write(Regs::CTRLA::SPEEDValC::fastplus_mode));
+            }
+            apply(set(Regs::CTRLA::enable));
+            waitSync_();
+            runtimeInit();
+            timing_      = t;
+            timingValid_ = true;
+            ++clockSwitches_;
+        }
+
         /// The block through a software reset and set up again, bus state idle. With
         /// `unmask` the interrupt is enabled at the end (initStepPeripheryEnable does it);
         /// the timeout path keeps it masked until its request is completed.
@@ -497,6 +598,8 @@ namespace Kvasir { namespace Sercom { namespace I2C {
             apply(set(Regs::CTRLA::swrst));
             waitSync_();
             apply(base::initStepPeripheryConfig);
+            // The block is back at baudRate's BAUD: the next request writes its own.
+            if constexpr(PerDeviceClock) { timingValid_ = false; }
             apply(base::initStepInterruptConfig);
             apply(set(Regs::CTRLA::enable));
             waitSync_();
@@ -599,10 +702,18 @@ namespace Kvasir { namespace Sercom { namespace I2C {
             receivedCount_ = 0;
             isrEntries_    = 0;
             requestStart_  = Clock::now();
-            timeoutTime_   = requestStart_
-                           + base::calcTransferTimeout(currentRequest_.sendData.size()
-                                                       + currentRequest_.receiveData.size());
-            active_        = true;
+            if constexpr(PerDeviceClock) {
+                timeoutTime_ = requestStart_
+                             + base::calcTransferTimeout(currentRequest_.sendData.size()
+                                                           + currentRequest_.receiveData.size(),
+                                                         currentRequest_.timing.usPerByte);
+                applyTiming_(currentRequest_.timing);
+            } else {
+                timeoutTime_ = requestStart_
+                             + base::calcTransferTimeout(currentRequest_.sendData.size()
+                                                         + currentRequest_.receiveData.size());
+            }
+            active_ = true;
 
             if(!currentRequest_.sendData.empty()) {
                 state_ = State::sending;
@@ -652,6 +763,12 @@ namespace Kvasir { namespace Sercom { namespace I2C {
         inline static std::uint32_t   drainedRequests_{};
         inline static std::uint32_t   syncWaitsExhausted_{};
         inline static TimeoutSnapshot lastTimeout_{};
+
+        // perDeviceClock: the BAUD in the block, and whether it is known (not after a
+        // reset). Members of a class template: never instantiated on a bus without it.
+        inline static ClockTiming   timing_{};
+        inline static bool          timingValid_{};
+        inline static std::uint32_t clockSwitches_{};
     };
 
 }}}   // namespace Kvasir::Sercom::I2C

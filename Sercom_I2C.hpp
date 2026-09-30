@@ -167,6 +167,50 @@ namespace Kvasir { namespace Sercom { namespace I2C { namespace Detail {
         }
     }
 
+    /// One device's BAUD on a bus that runs each device at its own clock
+    /// (I2CConfig::perDeviceClock), plus CTRLA.SPEED and the transfer timeout's time per byte.
+    struct ClockTiming {
+        std::uint8_t  baud{};
+        std::uint8_t  baudlow{};
+        std::uint8_t  speed{};   ///< CTRLA.SPEED: 0 standard and fast, 1 fast-mode plus
+        std::uint16_t usPerByte{};
+
+        constexpr bool operator==(ClockTiming const&) const = default;
+    };
+
+    // Not constexpr: reaching one in clockTiming() is the compile error that says why.
+    inline void i2cDeviceClockAboveFastModePlus() {}
+
+    inline void i2cDeviceClockErrorAboveMaxBaudRateError() {}
+
+    /// The transfer timeout's time per byte: 9 bits, 4 times over.
+    constexpr std::uint32_t usPerDataByte(std::uint32_t f_baud) {
+        constexpr std::uint32_t bitsPerDataByte = 9;
+        constexpr std::uint32_t safetyFactor    = 4;
+        return (bitsPerDataByte * 1'000'000 * safetyFactor) / f_baud;
+    }
+
+    /// calcBaudConfig and isValidBaudConfig for a rate known only per device. High-speed mode
+    /// is not offered per device: it needs a master code and CTRLA.SCLSM (28.6.2.4.6).
+    template<std::intmax_t Num,
+             std::intmax_t Denom>
+    consteval ClockTiming clockTiming(std::uint32_t f_clockSpeed,
+                                      std::uint32_t f_baud,
+                                      std::ratio<Num,
+                                                 Denom>) {
+        if(f_baud == 0 || f_baud > maxSpeedFastPlus) { i2cDeviceClockAboveFastModePlus(); }
+        auto const cfg    = calcBaudConfig(f_clockSpeed, f_baud);
+        auto const err    = calcf_Baud(f_clockSpeed, cfg) - double(f_baud);
+        auto const absErr = err > 0.0 ? err : -err;
+        if(absErr > double(f_baud) * (double(Num) / double(Denom))) {
+            i2cDeviceClockErrorAboveMaxBaudRateError();
+        }
+        return ClockTiming{.baud      = cfg.baud,
+                           .baudlow   = cfg.baudlow,
+                           .speed     = static_cast<std::uint8_t>(f_baud <= maxSpeedFast ? 0 : 1),
+                           .usPerByte = static_cast<std::uint16_t>(usPerDataByte(f_baud))};
+    }
+
     template<typename I2CConfig_>
     struct I2CBase {
         struct I2CConfig : I2CConfig_ {
@@ -183,6 +227,27 @@ namespace Kvasir { namespace Sercom { namespace I2C { namespace Detail {
                     return I2CConfig_::maxBaudRateError;
                 } else {
                     return std::ratio<1, 100>{};
+                }
+            }();
+
+            /// Each device at its own clock, switched between transfers (Sercom_I2CQueued's
+            /// timing()); `baudRate` is then the fastest any device gets and the rate the
+            /// block starts with.
+            static constexpr bool perDeviceClock = [] {
+                if constexpr(requires { I2CConfig_::perDeviceClock; }) {
+                    return static_cast<bool>(I2CConfig_::perDeviceClock);
+                } else {
+                    return false;
+                }
+            }();
+
+            /// The slowest rate a device on this bus runs at: what the idle watchdog of
+            /// LineRecovery scales its threshold with. Only perDeviceClock makes it differ.
+            static constexpr std::uint32_t minBaudRate = [] {
+                if constexpr(requires { I2CConfig_::minBaudRate; }) {
+                    return static_cast<std::uint32_t>(I2CConfig_::minBaudRate);
+                } else {
+                    return static_cast<std::uint32_t>(I2CConfig_::baudRate);
                 }
             }();
         };
@@ -203,6 +268,14 @@ namespace Kvasir { namespace Sercom { namespace I2C { namespace Detail {
         static_assert(isValidBaudConfig<I2CConfig::clockSpeed,
                                         I2CConfig::baudRate>(I2CConfig::maxBaudRateError),
                       "invalid baud configuration baudRate error to big");
+        static_assert(I2CConfig::minBaudRate <= I2CConfig::baudRate
+                        && (I2CConfig::perDeviceClock
+                            || I2CConfig::minBaudRate == I2CConfig::baudRate),
+                      "minBaudRate is the slowest device on a perDeviceClock bus, at most "
+                      "baudRate");
+        static_assert(!I2CConfig::perDeviceClock || I2CConfig::baudRate <= maxSpeedFastPlus,
+                      "a perDeviceClock bus switches between standard, fast and fast-mode plus "
+                      "only");
         static_assert(isValidPinLocationSDA<Instance>(I2CConfig::sdaPinLocation),
                       "invalid SDAPin");
         static_assert(isValidPinLocationSCL<Instance>(I2CConfig::sclPinLocation),
@@ -239,13 +312,11 @@ namespace Kvasir { namespace Sercom { namespace I2C { namespace Detail {
         /// on the wire (9 bits a byte, the address byte on top) and 10 ms -- the same rule as
         /// the RP driver's, so a part that stretches the clock is given the same patience on
         /// either chip.
-        static constexpr auto calcTransferTimeout(std::size_t numBytes) {
+        static constexpr auto calcTransferTimeout(std::size_t   numBytes,
+                                                  std::uint32_t microsecondsPerDataByte
+                                                  = usPerDataByte(I2CConfig::baudRate)) {
             using namespace std::chrono_literals;
-            constexpr std::uint32_t bitsPerDataByte = 9;
-            constexpr std::uint32_t safetyFactor    = 4;
-            constexpr auto          baseTimeout     = 10ms;
-            constexpr std::uint32_t microsecondsPerDataByte
-              = (bitsPerDataByte * 1'000'000 * safetyFactor) / I2CConfig::baudRate;
+            constexpr auto baseTimeout = 10ms;
 
             auto const timeoutUs
               = static_cast<std::uint32_t>(numBytes + 1) * microsecondsPerDataByte;
