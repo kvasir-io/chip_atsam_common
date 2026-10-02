@@ -7,6 +7,7 @@
 #include "kvasir/Io/Types.hpp"
 #include "kvasir/Mpl/Utility.hpp"
 #include "kvasir/Register/Register.hpp"
+#include "kvasir/Util/Prescaler.hpp"
 #include "peripherals/SERCOM_USART.hpp"
 
 #include <algorithm>
@@ -226,31 +227,22 @@ namespace Kvasir { namespace Sercom { namespace Usart {
             };
         };
 
+        // Arithmetic mode, 16 samples per bit: f_baud = f_ref / 16 x (1 - BAUD / 65536), BAUD 16
+        // bits (SAM D21 DS40001882L 25.6.2.3 Table 25-2; SAM C20/C21 Table 30-2; SAM D5x/E5x
+        // Table 33-2). As a multiplier: f_baud = f_ref x n / 2^20 with n = 65536 - BAUD, 1..65536.
+        static constexpr Prescaler::Multiplier ArithmeticBaud{.first = 1,
+                                                              .last  = 65536,
+                                                              .den   = std::uint64_t{1} << 20};
+
+        // the nearest BAUD; on a tie the larger BAUD (the slower rate), as round-half-up gave it
+        constexpr auto baudDivider(std::uint32_t f_clockSpeed,
+                                   std::uint32_t f_baud) {
+            return Prescaler::fromMultiplier(f_clockSpeed, f_baud, ArithmeticBaud);
+        }
+
         constexpr std::uint32_t calcBaudReg(std::uint32_t f_clockSpeed,
                                             std::uint32_t f_baud) {
-            auto baudReg = std::int64_t((65536.0   //NOLINT(bugprone-incorrect-roundings)
-                                         * (1.0 - 16.0 * (double(f_baud) / double(f_clockSpeed))))
-                                        + 0.5);
-            return static_cast<std::uint32_t>(std::clamp<std::int64_t>(baudReg, 0, 65535));
-        }
-
-        constexpr double calcf_Baud(std::uint32_t f_clockSpeed,
-                                    std::uint32_t baudReg) {
-            return (double(f_clockSpeed) / 16.0) * (1.0 - (double(baudReg) / 65536.0));
-        }
-
-        template<std::uint32_t f_clockSpeed,
-                 std::uint32_t f_baud,
-                 std::intmax_t Num,
-                 std::intmax_t Denom>
-        constexpr bool isValidBaudConfig(std::ratio<Num,
-                                                    Denom>) {
-            constexpr auto baudReg      = calcBaudReg(f_clockSpeed, f_baud);
-            constexpr auto f_baudCalced = calcf_Baud(f_clockSpeed, baudReg);
-            constexpr auto err          = f_baudCalced - double(f_baud);
-            constexpr auto absErr       = err > 0.0 ? err : -err;
-            constexpr auto ret = absErr <= (double(f_baud) * (double(Num) / (double(Denom))));
-            return ret;
+            return 65536U - baudDivider(f_clockSpeed, f_baud).setting;
         }
 
     }   // namespace Detail
@@ -295,10 +287,18 @@ namespace Kvasir { namespace Sercom { namespace Usart {
         static constexpr auto RxDmaTrigger = Traits::SercomTraits::DmaRX_Trigger<Instance>();
         static constexpr auto TxDmaTrigger = Traits::SercomTraits::DmaTX_Trigger<Instance>();
 
-        static_assert(
-          Detail::isValidBaudConfig<UsartConfig::clockSpeed,
-                                    UsartConfig::baudRate>(UsartConfig::maxBaudRateError),
-          "invalid baud configuration baudRate error to big");
+        // the achieved baud rate against maxBaudRateError; a failure prints wanted, got and ppm
+        static constexpr bool BaudInTolerance = [] {
+            Prescaler::assertInTolerance<
+              Detail::baudDivider(UsartConfig::clockSpeed, UsartConfig::baudRate).achieved,
+              UsartConfig::baudRate,
+              Prescaler::Tolerance{UsartConfig::maxBaudRateError},
+              "USART baud rate">();
+            return true;
+        }();
+        // a static data member of a class template is initialised only when used: this use is
+        // what runs the check
+        static_assert(BaudInTolerance);
         static_assert(Config::isValidPinLocationTX(UsartConfig::txPinLocation),
                       "invalid TXPin");
         static_assert(Config::isValidPinLocationRX(UsartConfig::rxPinLocation),

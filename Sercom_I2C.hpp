@@ -6,6 +6,7 @@
 #include "kvasir/Io/Types.hpp"
 #include "kvasir/Mpl/Utility.hpp"
 #include "kvasir/Register/Register.hpp"
+#include "kvasir/Util/Prescaler.hpp"
 #include "kvasir/Util/literals.hpp"
 #include "kvasir/Util/using_literals.hpp"
 #include "peripherals/SERCOM_I2CM.hpp"
@@ -107,41 +108,26 @@ namespace Kvasir { namespace Sercom { namespace I2C { namespace Detail {
         return {0, 0, raw.baud, raw.baudlow};
     }
 
-    constexpr double calcf_Baud(std::uint32_t f_clockSpeed,
-                                BaudConfig    baudConfig) {
+    /// The SCL rate the registers give, TRISE left out: f_SCL = f_GCLK / (10 + 2 BAUD) with BAUDLOW
+    /// 0, f_GCLK / (10 + BAUD + BAUDLOW) otherwise; high-speed f_GCLK / (2 + 2 HSBAUD) or
+    /// f_GCLK / (2 + HSBAUD + HSBAUDLOW) (SAM D21 DS40001882L 28.6.2.4.1).
+    constexpr Prescaler::Rational achievedRate(std::uint32_t f_clockSpeed,
+                                               BaudConfig    baudConfig) {
         if(baudConfig.baud == 0 && baudConfig.baudlow == 0) {
             // high_speed
             if(baudConfig.hsbaudlow == 0) {
-                return double(f_clockSpeed) / (2.0 + 2.0 * double(baudConfig.hsbaud));
+                return {f_clockSpeed, 2U + 2U * std::uint64_t{baudConfig.hsbaud}};
             }
-            return double(f_clockSpeed)
-                 / (2.0 + double(baudConfig.hsbaud) + double(baudConfig.hsbaudlow));
+            return {f_clockSpeed, 2U + std::uint64_t{baudConfig.hsbaud} + baudConfig.hsbaudlow};
         }
         if(baudConfig.hsbaud == 0 && baudConfig.hsbaudlow == 0) {
             // other
             if(baudConfig.baudlow == 0) {
-                return double(f_clockSpeed) / (10.0 + 2.0 * double(baudConfig.baud));
+                return {f_clockSpeed, 10U + 2U * std::uint64_t{baudConfig.baud}};
             }
-            return double(f_clockSpeed)
-                 / (10.0 + double(baudConfig.baud) + double(baudConfig.baudlow));
+            return {f_clockSpeed, 10U + std::uint64_t{baudConfig.baud} + baudConfig.baudlow};
         }
-        return std::numeric_limits<double>::min();
-    }
-
-    template<std::uint32_t f_clockSpeed,
-             std::uint32_t f_baud,
-             std::intmax_t Num,
-             std::intmax_t Denom>
-    constexpr bool isValidBaudConfig(std::ratio<Num,
-                                                Denom>) {
-        static_assert(f_baud <= maxSpeedHighSpeed, "baudRate to big");
-
-        constexpr auto baudConfig   = calcBaudConfig(f_clockSpeed, f_baud);
-        constexpr auto f_baudCalced = calcf_Baud(f_clockSpeed, baudConfig);
-        constexpr auto err          = f_baudCalced - double(f_baud);
-        constexpr auto absErr       = err > 0.0 ? err : -err;
-        constexpr auto ret          = absErr <= (double(f_baud) * (double(Num) / (double(Denom))));
-        return ret;
+        return {0, 1};
     }
 
     template<typename Regs, unsigned clockSpeed, unsigned baudRate>
@@ -178,10 +164,8 @@ namespace Kvasir { namespace Sercom { namespace I2C { namespace Detail {
         constexpr bool operator==(ClockTiming const&) const = default;
     };
 
-    // Not constexpr: reaching one in clockTiming() is the compile error that says why.
+    // Not constexpr: reaching it in clockTiming() is the compile error that says why.
     inline void i2cDeviceClockAboveFastModePlus() {}
-
-    inline void i2cDeviceClockErrorAboveMaxBaudRateError() {}
 
     /// The transfer timeout's time per byte: 9 bits, 4 times over.
     constexpr std::uint32_t usPerDataByte(std::uint32_t f_baud) {
@@ -190,7 +174,7 @@ namespace Kvasir { namespace Sercom { namespace I2C { namespace Detail {
         return (bitsPerDataByte * 1'000'000 * safetyFactor) / f_baud;
     }
 
-    /// calcBaudConfig and isValidBaudConfig for a rate known only per device. High-speed mode
+    /// calcBaudConfig and the tolerance check for a rate known only per device. High-speed mode
     /// is not offered per device: it needs a master code and CTRLA.SCLSM (28.6.2.4.6).
     template<std::intmax_t Num,
              std::intmax_t Denom>
@@ -199,12 +183,11 @@ namespace Kvasir { namespace Sercom { namespace I2C { namespace Detail {
                                       std::ratio<Num,
                                                  Denom>) {
         if(f_baud == 0 || f_baud > maxSpeedFastPlus) { i2cDeviceClockAboveFastModePlus(); }
-        auto const cfg    = calcBaudConfig(f_clockSpeed, f_baud);
-        auto const err    = calcf_Baud(f_clockSpeed, cfg) - double(f_baud);
-        auto const absErr = err > 0.0 ? err : -err;
-        if(absErr > double(f_baud) * (double(Num) / double(Denom))) {
-            i2cDeviceClockErrorAboveMaxBaudRateError();
-        }
+        auto const cfg = calcBaudConfig(f_clockSpeed, f_baud);
+        // out of tolerance: the note "in call to 'rateOutOfTolerance(...)'" has the numbers
+        Prescaler::requireInTolerance(achievedRate(f_clockSpeed, cfg),
+                                      f_baud,
+                                      Prescaler::Tolerance{std::ratio<Num, Denom>{}});
         return ClockTiming{.baud      = cfg.baud,
                            .baudlow   = cfg.baudlow,
                            .speed     = static_cast<std::uint8_t>(f_baud <= maxSpeedFast ? 0 : 1),
@@ -241,6 +224,16 @@ namespace Kvasir { namespace Sercom { namespace I2C { namespace Detail {
                 }
             }();
 
+            /// Count the requests accepted for the wire (Sercom_I2CQueued's transfers()). Off,
+            /// neither the counter nor its increment is in the image.
+            static constexpr bool countTransfers = [] {
+                if constexpr(requires { I2CConfig_::countTransfers; }) {
+                    return static_cast<bool>(I2CConfig_::countTransfers);
+                } else {
+                    return false;
+                }
+            }();
+
             /// The slowest rate a device on this bus runs at: what the idle watchdog of
             /// LineRecovery scales its threshold with. Only perDeviceClock makes it differ.
             static constexpr std::uint32_t minBaudRate = [] {
@@ -265,9 +258,21 @@ namespace Kvasir { namespace Sercom { namespace I2C { namespace Detail {
 
         using InterruptIndexs = decltype(Traits::SercomTraits::getSercomIsrIndexs<Instance>());
 
-        static_assert(isValidBaudConfig<I2CConfig::clockSpeed,
-                                        I2CConfig::baudRate>(I2CConfig::maxBaudRateError),
-                      "invalid baud configuration baudRate error to big");
+        static_assert(I2CConfig::baudRate <= maxSpeedHighSpeed,
+                      "baudRate to big");
+        // the achieved SCL against maxBaudRateError; a failure prints wanted, got and ppm
+        static constexpr bool BaudInTolerance = [] {
+            Prescaler::assertInTolerance<achievedRate(I2CConfig::clockSpeed,
+                                                      calcBaudConfig(I2CConfig::clockSpeed,
+                                                                     I2CConfig::baudRate)),
+                                         I2CConfig::baudRate,
+                                         Prescaler::Tolerance{I2CConfig::maxBaudRateError},
+                                         "I2C SCL">();
+            return true;
+        }();
+        // a static data member of a class template is initialised only when used: this use is
+        // what runs the check
+        static_assert(BaudInTolerance);
         static_assert(I2CConfig::minBaudRate <= I2CConfig::baudRate
                         && (I2CConfig::perDeviceClock
                             || I2CConfig::minBaudRate == I2CConfig::baudRate),

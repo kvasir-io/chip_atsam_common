@@ -7,16 +7,13 @@
 #include "kvasir/Atomic/Atomic.hpp"
 #include "kvasir/Devices/Quantities.hpp"
 #include "kvasir/Devices/SPI/QueueCore.hpp"
+#include "kvasir/StartUp/Hooks.hpp"
+#include "kvasir/Util/Prescaler.hpp"
 
 #include <cstdint>
 #include <string_view>
 
 namespace Kvasir { namespace Sercom { namespace SPI {
-
-    namespace Detail {
-        /// Not constexpr: reaching it in setup() is the compile error.
-        inline void deviceClockBelowWhatTheSercomCanDivideTo() {}
-    }   // namespace Detail
 
     template<typename SPIConfig,
              typename Clock,
@@ -49,7 +46,10 @@ namespace Kvasir { namespace Sercom { namespace SPI {
             std::uint32_t const ref = SPIConfig::clockSpeed;
             std::uint32_t const div = (ref + 2U * max - 1U) / (2U * max);   // BAUD + 1
             if(div == 0U || div > 256U) {
-                Detail::deviceClockBelowWhatTheSercomCanDivideTo();
+                // the note "in call to 'rateOutOfReach(wanted Hz, slowest mHz, fastest mHz)'"
+                Prescaler::rateOutOfReach(max,
+                                          std::uint64_t{ref} * 1000U / 512U,
+                                          std::uint64_t{ref} * 1000U / 2U);
                 return Setup{};
             }
             auto const m = static_cast<std::uint8_t>(mode);
@@ -240,6 +240,10 @@ namespace Kvasir { namespace Sercom { namespace SPI {
         static void releaseHold(Kvasir::SPI::Lines const& l) { Core::releaseHold(l); }
 
         static void handler() { Core::handler(); }
+
+        // once per main-loop turn: Startup::run<Kvasir::Hook::MainLoop>() calls it (StartUp/Hooks.hpp);
+        // a firmware that runs the hook must not also call handler() by hand
+        using Extends = Kvasir::Startup::Extend<Kvasir::Hook::MainLoop, &handler>;
 
         static void reset() { Core::reset(); }
     };

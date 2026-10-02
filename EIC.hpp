@@ -1,9 +1,28 @@
 #pragma once
+// The SAM EIC: external interrupt lines as Startup entries.
+//
+// Each user of an EXTINT line (button, encoder, zero-cross, PPS) is or contains an EIC::ExtInt,
+// which brings its pin config, CONFIGn/EVCTRL settings and a sub-interrupt (SubIsrs). Startup
+// merges the lines of one vector into one generated ISR (SharedIsr.hpp). EicBase (bus clock and
+// CTRL.ENABLE) must be in the same Startup; two users of one EXTINT number are a compile error.
+//
+// Data sheet facts (D21 DS40001882L, C21 DS60001479M):
+//   - INTFLAG.EXTINT[x] is write-one-to-clear (D21 21.8.8, md 15492; C21 26.8.8, md 18709).
+//   - The request needs flag AND enable (D21 21.6.6, md 15158), hence the INTENSET test.
+//   - D21/C21 share one NVIC line for all lines (D21 Table 11-3, md 1856; C21 Table 10-3,
+//     md 2193); D5x/E5x has one per line (Table 10-1, md 2785). See EicExtIntVector<x>.
+//   - CONFIGn and EVCTRL are written while the EIC is disabled (D21 21.6.2.1, md 15036).
+//   - Spurious INTFLAG at enable (D21 errata 1.9.1, C21 errata 1.11.3): handled in EicBase.
 
 #include "core/Nvic.hpp"
 #include "kvasir/Io/Types.hpp"
 #include "kvasir/Register/Register.hpp"
+#include "kvasir/StartUp/Resources.hpp"
+#include "kvasir/StartUp/SharedIsr.hpp"
 #include "peripherals/EIC.hpp"
+
+#include <cstdint>
+#include <utility>
 
 namespace Kvasir { namespace EIC {
     enum class InterruptType {
@@ -17,22 +36,14 @@ namespace Kvasir { namespace EIC {
     };
 
     namespace detail {
+        using Regs = Kvasir::Peripheral::EIC::Registers<>;
 
-        template<unsigned bit, typename Org>
-        struct INTENSET {
-            static_assert(bit < 16,
-                          "not a valid pin");
-            using Addr     = typename Org::Addr;
-            using Loc      = decltype(Org::extint);
-            using Access   = typename Loc::Access;
-            using DataType = typename Loc::DataType;
-
-            static constexpr auto set() {
-                return Kvasir::Register::set(
-                  Register::
-                    FieldLocation<Addr, Register::maskFromRange(bit, bit), Access, DataType>{});
-            }
-        };
+        // One EXTINT bit of INTFLAG / INTENSET, typed as the register's own EXTINT field.
+        template<unsigned Line, typename Org>
+        using ExtIntBit = Register::FieldLocation<typename Org::Addr,
+                                                  Register::maskFromRange(Line, Line),
+                                                  typename decltype(Org::extint)::Access,
+                                                  typename decltype(Org::extint)::DataType>;
 
         template<unsigned bit, typename Org>
         struct EVCTRL {
@@ -57,37 +68,6 @@ namespace Kvasir { namespace EIC {
                 } else {
                     return brigand::list<>();
                 }
-            }
-        };
-
-        template<unsigned bit, typename Org>
-        struct INTFLAG {
-            using Addr     = typename Org::Addr;
-            using AddrT    = typename Addr::RegType;
-            using Loc      = decltype(Org::extint);
-            using Access   = typename Loc::Access;
-            using DataType = typename Loc::DataType;
-
-            static_assert(bit < 16,
-                          "not a valid pin");
-
-            static constexpr auto clear() {
-                return Kvasir::Register::set(
-                  Register::
-                    FieldLocation<Addr, Register::maskFromRange(bit, bit), Access, DataType>{});
-            }
-
-            static constexpr auto runtimeClear(bool b) {
-                return Kvasir::Register::write(
-                  Register::
-                    FieldLocation<Addr, Register::maskFromRange(bit, bit), Access, DataType>{},
-                  static_cast<DataType>(b ? 1U : 0U));
-            }
-
-            static constexpr auto get() {
-                return Kvasir::Register::read(
-                  Register::
-                    FieldLocation<Addr, Register::maskFromRange(bit, bit), Access, DataType>{});
             }
         };
 
@@ -130,6 +110,9 @@ namespace Kvasir { namespace EIC {
             static_assert(InterruptType::LevelLow
                           == static_cast<InterruptType>(Org::SENSE0Val::low));
 
+            // A plain store of the merged CONFIGn value (every bit write-ignored-if-zero): the
+            // lines of one CONFIGn register, whoever declares them, are written together by
+            // Startup's single apply of initStepPeripheryConfig.
             template<InterruptType type>
             static constexpr auto setInterruptType() {
                 return Kvasir::Register::write(
@@ -157,141 +140,119 @@ namespace Kvasir { namespace EIC {
             }
         };
 
-        template<typename Reg,
-                 int Port,
+        // The EXTINT line a pin drives on function A: pin % 16, except PA24/PA25 -> 12/13,
+        // PA27 -> 15, PA28 -> 8, PA30/PA31 -> 10/11, and PA08 is the NMI (SAM D21 Table 7-1,
+        // md 1032-1093; SAM C21 Table 6-2, md 1253-1316). The D5x/E5x differs (PA24 on EXTINT[8],
+        // DS60001507N md 1401) and would need its own table.
+        inline constexpr unsigned noExtInt = 16;
+
+        template<int Port,
                  int Pin>
-        constexpr auto enablePinInterrupt(Register::PinLocation<Port,
-                                                                Pin>) {
-            return INTENSET<Pin % 16, Reg>::set();
+        consteval unsigned extIntOf(Register::PinLocation<Port,
+                                                          Pin>) {
+            if constexpr(Port == 0) {
+                switch(Pin) {
+                case 8:  return noExtInt;
+                case 24: return 12;
+                case 25: return 13;
+                case 27: return 15;
+                case 28: return 8;
+                case 30: return 10;
+                case 31: return 11;
+                default: break;
+                }
+            }
+            return static_cast<unsigned>(Pin % 16);
         }
-
-        template<template<unsigned> typename Reg,
-                 InterruptType Type,
-                 int           Port,
-                 int           Pin>
-        constexpr auto setInterruptType(Register::PinLocation<Port,
-                                                              Pin>) {
-            // use with care
-            return CONFIG<Pin % 16, Reg>::template setInterruptType<Type>();
-        }
-
-        template<template<unsigned> typename Reg,
-                 bool Filter,
-                 int  Port,
-                 int  Pin>
-        constexpr auto setFilter(Register::PinLocation<Port,
-                                                       Pin>) {
-            // use with care
-            return CONFIG<Pin % 16, Reg>::template setFilter<Filter>();
-        }
-
-        template<typename Reg,
-                 bool Event,
-                 int  Port,
-                 int  Pin>
-        constexpr auto setEvent(Register::PinLocation<Port,
-                                                      Pin>) {
-            // use with care
-            return EVCTRL<Pin % 16, Reg>::template setEvent<Event>();
-        }
-
-        template<typename Reg,
-                 int Port,
-                 int Pin>
-        constexpr auto RuntimeClearInterrupt(Register::PinLocation<Port,
-                                                                   Pin>,
-                                             bool v) {
-            return INTFLAG<Pin % 16, Reg>::runtimeClear(v);
-        }
-
-        template<typename Reg,
-                 int Port,
-                 int Pin>
-        constexpr auto getInterruptFlag(Register::PinLocation<Port,
-                                                              Pin>) {
-            return INTFLAG<Pin % 16, Reg>::get();
-        }
-
     }   // namespace detail
 
-    template<typename Clock, typename EICConfig, typename... PinConfigs>
+    // An EXTINT number: the line that configures it provides it, so a second user of the same
+    // line (another pin on that EXTINT, D21 21.6.6 note 2, md 15164: "only one will be active")
+    // is a compile error.
+    struct ExtIntLineTag {};
+
+    // The EIC block: its bus clock and CTRL.ENABLE, after every line's configuration. The GCLK
+    // channel that clocks edge detection and the filter (GCLK_EIC) is the firmware's clock
+    // settings' business.
     struct EicBase {
-        using Regs                   = Kvasir::Peripheral::EIC::Registers<>;
+        using Regs                   = detail::Regs;
         static constexpr unsigned ba = Regs::baseAddr;
-        using InterruptIndex         = decltype(Kvasir::Interrupt::eic);
 
         static constexpr auto powerClockEnable = list(typename PM::enable<ba>::action{});
+
+        // Enabling the EIC with the filter on can raise a spurious INTFLAG.EXTINTx for RISE, BOTH
+        // or LOW lines (SAM D21 errata DS80000760 1.9.1, SAM C20/C21 DS80000740 1.11.3). So:
+        // enable, wait for sync, clear every flag and the vector's pending bit; Startup's
+        // PeripheryEnable step enables the vector afterwards.
+        static void preEnableRuntimeInit() {
+            apply(Regs::CTRLA::overrideDefaults(set(Regs::CTRLA::enable)));
+            waitForSync<Regs>();
+            using Flags = typename decltype(Regs::INTFLAG::FULLREGISTER)::DataType;
+            apply(write(Regs::INTFLAG::FULLREGISTER, static_cast<Flags>(~Flags{})));
+            clearPending(std::make_index_sequence<16>{});
+        }
+
+    private:
+        template<typename R>
+        static void waitForSync() {
+            if constexpr(requires { R::STATUS::syncbusy; }) {
+                while(apply(read(R::STATUS::syncbusy))) {}   // D21: STATUS.SYNCBUSY
+            } else {
+                while(apply(read(R::SYNCBUSY::enable))) {}   // C21/E5x: SYNCBUSY.ENABLE
+            }
+        }
+
+        template<std::size_t... Lines>
+        static void clearPending(std::index_sequence<Lines...>) {
+            (apply(Nvic::makeClearPending(Kvasir::Interrupt::EicExtIntVector<Lines>{})), ...);
+        }
+    };
+
+    // One EXTINT line: Pin on the EIC, Type its sense, Callback (void()) run in the interrupt for
+    // each detection, at NVIC priority Priority (every line of one vector has to agree). Filter:
+    // the majority filter (CONFIGn.FILTENx); Event: EVCTRL.EXTINTEOx, the line's event output.
+    template<typename Pin,
+             InterruptType         Type,
+             auto                  Callback,
+             int                   Priority,
+             Io::PullConfiguration Pull   = Io::PullConfiguration::PullUp,
+             bool                  Filter = true,
+             bool                  Event  = false>
+    struct ExtInt {
+        static constexpr unsigned line = detail::extIntOf(Pin{});
+        static_assert(line != detail::noExtInt,
+                      "PA08 is the NMI pin: it drives no EXTINT line");
+        static_assert(Priority >= 0,
+                      "an EXTINT line needs its NVIC priority");
+
+        using Regs   = detail::Regs;
+        using Vector = Kvasir::Interrupt::EicExtIntVector<line>;
+
+        static constexpr detail::ExtIntBit<line, typename Regs::INTFLAG>  flag{};
+        static constexpr detail::ExtIntBit<line, typename Regs::INTENSET> enable{};
+
+        // the line is this entry's; the EIC has to be enabled by an EicBase in the list
+        using Provides = brigand::list<Startup::Resource<ExtIntLineTag, line>>;
+        using Claims   = brigand::list<Startup::Listed<EicBase>>;
+
+        using SubIsrs = brigand::list<Nvic::SubIsr<Vector,
+                                                   Callback,
+                                                   Nvic::RawStatus<flag, enable>,
+                                                   Nvic::ClearLast<flag>,
+                                                   Nvic::Enable<enable>,
+                                                   Priority>>;
 
         static constexpr auto initStepPinConfig
           = list(action(Kvasir::Io::Action::PinFunction<0,
                                                         Io::OutputType::PushPull,
                                                         Io::OutputSpeed::Low,
                                                         Io::OutputInit::Low,
-                                                        PinConfigs::pull>{},
-                        PinConfigs::pin)...);
+                                                        Pull>{},
+                        Pin{}));
 
         static constexpr auto initStepPeripheryConfig
-          = list(detail::enablePinInterrupt<Regs::INTENSET>(PinConfigs::pin)...,
-                 detail::setInterruptType<Regs::CONFIG, PinConfigs::type>(PinConfigs::pin)...,
-                 detail::setFilter<Regs::CONFIG, PinConfigs::filter>(PinConfigs::pin)...,
-                 detail::setEvent<Regs::EVCTRL, PinConfigs::enableEvent>(PinConfigs::pin)...);
-
-        static constexpr auto initStepInterruptConfig = list(
-          action(Kvasir::Nvic::Action::SetPriority<EICConfig::IsrPriority>{}, InterruptIndex{}),
-          action(Kvasir::Nvic::Action::clearPending, InterruptIndex{}));
-
-        static constexpr auto initStepPeripheryEnable
-          = list(Regs::CTRLA::overrideDefaults(set(Regs::CTRLA::enable)),
-                 makeEnable(InterruptIndex{}));
-
-        template<std::size_t I,
-                 typename Flags,
-                 typename CBS>
-        static void callIfTrue(Flags flags,
-                               CBS   cbs) {
-            if(Kvasir::Register::get<I>(flags)) { std::get<I>(cbs)(); }
-        }
-
-        template<typename Flags,
-                 typename CBS,
-                 std::size_t... Is>
-        static void callIfTrue(Flags flags,
-                               CBS   cbs,
-                               std::index_sequence<Is...>) {
-            return ((callIfTrue<Is>(flags, cbs)), ...);
-        }
-
-        template<std::size_t I,
-                 typename Flags,
-                 typename Pins>
-        static auto clearIfTrue(Flags flags,
-                                Pins  pins) {
-            return detail::RuntimeClearInterrupt<Regs::INTFLAG>(std::get<I>(pins),
-                                                                Kvasir::Register::get<I>(flags));
-        }
-
-        template<typename Flags,
-                 typename Pins,
-                 std::size_t... Is>
-        static void clearIfTrue(Flags flags,
-                                Pins  pins,
-                                std::index_sequence<Is...>) {
-            return Kvasir::Register::apply(clearIfTrue<Is>(flags, pins)...);
-        }
-
-        // ISR
-        static void onIsr() {
-            static constexpr auto pins = std::tuple<decltype(PinConfigs::pin)...>{};
-            static constexpr auto callbacks
-              = std::tuple<decltype(PinConfigs::callback)...>{PinConfigs::callback...};
-            auto const flags = apply(detail::getInterruptFlag<Regs::INTFLAG>(PinConfigs::pin)...);
-
-            callIfTrue(flags, callbacks, std::make_index_sequence<sizeof...(PinConfigs)>{});
-            clearIfTrue(flags, pins, std::make_index_sequence<sizeof...(PinConfigs)>{});
-        }
-
-        static constexpr Kvasir::Nvic::Isr<std::addressof(onIsr),
-                                           std::remove_const_t<InterruptIndex>>
-          isr{};
+          = list(detail::CONFIG<line, Regs::CONFIG>::template setInterruptType<Type>(),
+                 detail::CONFIG<line, Regs::CONFIG>::template setFilter<Filter>(),
+                 detail::EVCTRL<line, typename Regs::EVCTRL>::template setEvent<Event>());
     };
 }}   // namespace Kvasir::EIC

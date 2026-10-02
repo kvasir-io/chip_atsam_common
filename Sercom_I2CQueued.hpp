@@ -4,11 +4,14 @@
 #include "kvasir/Atomic/Queue.hpp"
 #include "kvasir/Devices/I2C/LineRecovery.hpp"
 #include "kvasir/Register/Apply.hpp"
+#include "kvasir/StartUp/Hooks.hpp"
 #include "kvasir/Util/RateLimiter.hpp"
 #include "kvasir/Util/StaticFunction.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -33,7 +36,7 @@ namespace Kvasir { namespace Sercom { namespace I2C {
     ///  * a NAK is reported as `notAcknowledged` and a bus error as `failed`. The engine
     ///    counts only NAKs towards declaring a device absent, so this is what makes
     ///    parking and probing work;
-    ///  * the payload is read straight out of `sendData` and written straight into
+    ///  * the payload is read straight out of `prefix` + `sendData` and written straight into
     ///    `receiveData`, so a transfer is not limited by an internal buffer;
     ///  * requests queue, so a device can submit from inside another's callback.
     ///
@@ -61,11 +64,38 @@ namespace Kvasir { namespace Sercom { namespace I2C {
 
     template<std::size_t CallbackSize>
     struct I2CRequest {
-        std::uint8_t                                         address{};
+        static constexpr std::size_t MaxPrefix = 2;
+
+        std::uint8_t address{};
+        /// Sent ahead of sendData in the same write, with no START or STOP between them: a
+        /// register address, an EEPROM memory address, a display's control byte. Up to two
+        /// bytes, kept in the padding behind `address`, so the request stays the size it was
+        /// (the RP driver's request is the same struct).
+        std::uint8_t                                         prefixBytes{};
+        std::array<std::byte, MaxPrefix>                     prefix{};
         std::span<std::byte const>                           sendData{};
         std::span<std::byte>                                 receiveData{};
         StaticFunction<void(I2CRequestResult), CallbackSize> callback{};
+
+        template<std::integral... B>
+            requires(sizeof...(B) <= MaxPrefix)
+        constexpr void setPrefix(B... b) {
+            prefix      = {std::byte{static_cast<std::uint8_t>(b)}...};
+            prefixBytes = sizeof...(B);
+        }
+
+        /// Everything that goes out after the address, prefix first.
+        [[nodiscard]] constexpr std::size_t sendBytes() const {
+            return prefixBytes + sendData.size();
+        }
+
+        [[nodiscard]] constexpr std::byte sendByte(std::size_t i) const {
+            return i < prefixBytes ? prefix[i] : sendData[i - prefixBytes];
+        }
     };
+
+    static_assert(sizeof(void*) != 4 || sizeof(I2CRequest<16>) == 40,
+                  "the prefix must stay in the padding behind address");
 
     /// The request of a bus with I2CConfig::perDeviceClock: the device's BAUD ride along.
     /// A type of its own, not a parameter of I2CRequest, so that a bus without the feature
@@ -106,6 +136,8 @@ namespace Kvasir { namespace Sercom { namespace I2C {
         /// Each device at its own clock (I2CConfig::perDeviceClock). Off, a request has no
         /// timing member and startNext_() never looks at BAUD: nothing of this is in the image.
         static constexpr bool PerDeviceClock = base::I2CConfig::perDeviceClock;
+        /// Count the requests accepted for the wire (I2CConfig::countTransfers, transfers()).
+        static constexpr bool CountTransfers = base::I2CConfig::countTransfers;
         using ClockTiming                    = Detail::ClockTiming;
         /// The timing of baudRate itself, what a request without one of its own carries.
         static constexpr ClockTiming DefaultTiming = [] {
@@ -176,6 +208,8 @@ namespace Kvasir { namespace Sercom { namespace I2C {
             requestQueue_.push(req);
 
             apply(Nvic::makeDisable(typename base::InterruptIndexs{}));
+            // inside the masked window: submit() also runs from completion callbacks in the ISR
+            if constexpr(CountTransfers) { ++transfers_; }
             tryStart_(Clock::now());
             // From a callback reset() or requestRecovery() runs, the interrupt stays masked:
             // they unmask it when they are done.
@@ -292,6 +326,11 @@ namespace Kvasir { namespace Sercom { namespace I2C {
             }
         }
 
+        // once per main-loop turn: Startup::run<Kvasir::Hook::MainLoop>() calls it (StartUp/Hooks.hpp);
+        // a firmware that runs the hook must not also call handler() by hand
+        using Extends
+          = Kvasir::Startup::Extend<Kvasir::Hook::MainLoop, &I2CBehaviorQueued::handler>;
+
         /// A full bus recovery sequence, non-blocking. Safe to call at any time. Any active
         /// transaction is failed at once, and so is everything queued.
         static void requestRecovery() {
@@ -351,6 +390,16 @@ namespace Kvasir { namespace Sercom { namespace I2C {
         /// The name is the RP driver's, where the wait is for IC_ENABLE_STATUS: the same
         /// kind of event, a block that does not follow its own handshake.
         static std::uint32_t disableWaitsExhausted() { return syncWaitsExhausted_; }
+
+        /// Requests accepted for the wire since boot: what tells "nothing talks on this bus"
+        /// from "nothing went wrong on it" (I2CConfig::countTransfers only, 0 without it).
+        static std::uint32_t transfers() {
+            if constexpr(CountTransfers) {
+                return transfers_;
+            } else {
+                return 0;
+            }
+        }
 
         /// Times startNext_() rewrote BAUD for a device at another clock (perDeviceClock only, 0
         /// without it).
@@ -472,9 +521,9 @@ namespace Kvasir { namespace Sercom { namespace I2C {
                     ++spuriousIsr_;
                     return;
                 }
-                if(sendIndex_ < currentRequest_.sendData.size()) {
+                if(sendIndex_ < currentRequest_.sendBytes()) {
                     apply(write(Regs::DATA::data,
-                                static_cast<std::uint8_t>(currentRequest_.sendData[sendIndex_])));
+                                static_cast<std::uint8_t>(currentRequest_.sendByte(sendIndex_))));
                     ++sendIndex_;
                 } else if(!currentRequest_.receiveData.empty()) {
                     // repeated START into the read phase
@@ -616,7 +665,7 @@ namespace Kvasir { namespace Sercom { namespace I2C {
               .ctrlA      = Kvasir::Register::get<0>(apply(read(Regs::CTRLA::FULLREGISTER))),
               .syncBusy   = Kvasir::Register::get<0>(apply(read(Regs::SYNCBUSY::FULLREGISTER))),
               .sent       = static_cast<std::uint16_t>(sendIndex_),
-              .toSend     = static_cast<std::uint16_t>(currentRequest_.sendData.size()),
+              .toSend     = static_cast<std::uint16_t>(currentRequest_.sendBytes()),
               .received   = static_cast<std::uint16_t>(receivedCount_),
               .toReceive  = static_cast<std::uint16_t>(currentRequest_.receiveData.size()),
               .address    = currentRequest_.address,
@@ -701,21 +750,25 @@ namespace Kvasir { namespace Sercom { namespace I2C {
             sendIndex_     = 0;
             receivedCount_ = 0;
             isrEntries_    = 0;
-            requestStart_  = Clock::now();
+            // Every start goes through here -- submit(), handler(), and the ISR chaining the
+            // next request after a success -- and each one is the bus seen free (LineRecovery
+            // noteBusFree(): the stuck timer must not outlive the transfers, as on the RP).
+            Recovery::noteBusFree();
+            requestStart_ = Clock::now();
             if constexpr(PerDeviceClock) {
                 timeoutTime_ = requestStart_
-                             + base::calcTransferTimeout(currentRequest_.sendData.size()
+                             + base::calcTransferTimeout(currentRequest_.sendBytes()
                                                            + currentRequest_.receiveData.size(),
                                                          currentRequest_.timing.usPerByte);
                 applyTiming_(currentRequest_.timing);
             } else {
                 timeoutTime_ = requestStart_
-                             + base::calcTransferTimeout(currentRequest_.sendData.size()
+                             + base::calcTransferTimeout(currentRequest_.sendBytes()
                                                          + currentRequest_.receiveData.size());
             }
             active_ = true;
 
-            if(!currentRequest_.sendData.empty()) {
+            if(currentRequest_.sendBytes() != 0) {
                 state_ = State::sending;
                 apply(write(Regs::ADDR::addr, unsigned(currentRequest_.address) << 1U));
             } else if(!currentRequest_.receiveData.empty()) {
@@ -759,6 +812,7 @@ namespace Kvasir { namespace Sercom { namespace I2C {
         inline static std::uint32_t   longestFirstIsrUs_{};
         inline static std::uint32_t   longestIsrGapUs_{};
         inline static std::uint32_t   timeouts_{};
+        inline static std::uint32_t   transfers_{};   // countTransfers only: never used without it
         inline static std::uint32_t   sdaLowAfterAbort_{};
         inline static std::uint32_t   drainedRequests_{};
         inline static std::uint32_t   syncWaitsExhausted_{};

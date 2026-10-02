@@ -252,7 +252,17 @@ public:
 
         using FreeBuffers = std::array<bool, 1>;
 
-        static FreeBuffers freeBuffers() { return {!withController()}; }
+        // IN: a bank is free only once its completion has been reported. Armed between TRCPT1
+        // and the interrupt that clears it, a new transfer would sit next to the old one's flag
+        // and cancel() would take it for "the new one went out". OUT checks the same in
+        // armReceive().
+        static FreeBuffers freeBuffers() {
+            if constexpr(IsIn) {
+                return {!withController() && !completionPending()};
+            } else {
+                return {!withController()};
+            }
+        }
 
         static std::size_t armedBuffers() { return withController() ? 1 : 0; }
 

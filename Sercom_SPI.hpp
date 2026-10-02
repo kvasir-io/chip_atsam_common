@@ -8,6 +8,7 @@
 #include "kvasir/Io/Types.hpp"
 #include "kvasir/Mpl/Utility.hpp"
 #include "kvasir/Register/Register.hpp"
+#include "kvasir/Util/Prescaler.hpp"
 #include "kvasir/Util/literals.hpp"
 #include "kvasir/Util/using_literals.hpp"
 #include "peripherals/SERCOM_SPI.hpp"
@@ -248,29 +249,27 @@ namespace Kvasir { namespace Sercom { namespace SPI {
             };
         };
 
+        // f_sck = f_ref / (2 (BAUD + 1)) (SAM D21 DS40001882L 25.6.2.3 Table 25-2, synchronous;
+        // SAM C20/C21 Table 30-2; SAM D5x/E5x Table 33-2); BAUD is 8 bits (D21 27.8.3). As a
+        // divider 2 x (BAUD + 1), BAUD + 1 in 1..256, the closest SCK not above the request, as
+        // Sercom_SPIQueued does it: the clock never runs faster than asked, unless even BAUD 255
+        // is too fast.
+        static constexpr Prescaler::Fixed SckDivider{.intMin   = 1,
+                                                     .intMax   = 256,
+                                                     .fracBits = 0,
+                                                     .scale    = 2};
+
+        constexpr auto baudDivider(std::uint32_t f_clockSpeed,
+                                   std::uint32_t f_baud) {
+            return Prescaler::fromFixedPoint(f_clockSpeed,
+                                             f_baud,
+                                             SckDivider,
+                                             Prescaler::Pick::notAbove);
+        }
+
         constexpr std::uint32_t calcBaudReg(std::uint32_t f_clockSpeed,
                                             std::uint32_t f_baud) {
-            auto baudReg = std::int64_t((double(f_clockSpeed) / (2.0 * double(f_baud))) - 1.0);
-            return static_cast<std::uint32_t>(std::clamp<std::int64_t>(baudReg, 0, 256));
-        }
-
-        constexpr double calcf_Baud(std::uint32_t f_clockSpeed,
-                                    std::uint32_t baudReg) {
-            return (double(f_clockSpeed) / (2.0 * (double(baudReg) + 1.0)));
-        }
-
-        template<std::uint32_t f_clockSpeed,
-                 std::uint32_t f_baud,
-                 std::intmax_t Num,
-                 std::intmax_t Denom>
-        constexpr bool isValidBaudConfig(std::ratio<Num,
-                                                    Denom>) {
-            constexpr auto baudReg      = calcBaudReg(f_clockSpeed, f_baud);
-            constexpr auto f_baudCalced = calcf_Baud(f_clockSpeed, baudReg);
-            constexpr auto err          = f_baudCalced - double(f_baud);
-            constexpr auto absErr       = err > 0.0 ? err : -err;
-            constexpr auto ret = absErr <= (double(f_baud) * (double(Num) / (double(Denom))));
-            return ret;
+            return baudDivider(f_clockSpeed, f_baud).setting.integer - 1U;
         }
 
     }   // namespace Detail
@@ -315,9 +314,18 @@ namespace Kvasir { namespace Sercom { namespace SPI {
         static constexpr auto RxDmaTrigger = Traits::SercomTraits::DmaRX_Trigger<Instance>();
         static constexpr auto TxDmaTrigger = Traits::SercomTraits::DmaTX_Trigger<Instance>();
 
-        static_assert(Detail::isValidBaudConfig<SPIConfig::clockSpeed,
-                                                SPIConfig::baudRate>(SPIConfig::maxBaudRateError),
-                      "invalid baud configuration baudRate error to big");
+        // the achieved SCK against maxBaudRateError; a failure prints wanted, got and ppm
+        static constexpr bool BaudInTolerance = [] {
+            Prescaler::assertInTolerance<
+              Detail::baudDivider(SPIConfig::clockSpeed, SPIConfig::baudRate).achieved,
+              SPIConfig::baudRate,
+              Prescaler::Tolerance{SPIConfig::maxBaudRateError},
+              "SPI SCK">();
+            return true;
+        }();
+        // a static data member of a class template is initialised only when used: this use is
+        // what runs the check
+        static_assert(BaudInTolerance);
         static_assert(Config::isValidPinLocationMISO(SPIConfig::misoPinLocation),
                       "invalid MISOPin");
         static_assert(Config::isValidPinLocationMOSI(SPIConfig::mosiPinLocation),

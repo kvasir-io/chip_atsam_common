@@ -1,0 +1,58 @@
+name: CI
+
+# The host tests of the clock solver (tests/CMakeLists.txt): most checks are static_asserts, so building is the test,
+# and the must_fail_* tests compile must_fail.cpp and look for the error message. They run on the test limits in
+# tests/TestLimits.hpp and need only Kvasir_SDK's Util/Prescaler.hpp, cloned next to this checkout. The chips' real
+# limits are tested in each chip package's own CI, against the chip_atsam_common commit it records.
+
+on:
+    push:
+        branches:
+            - master
+    pull_request:
+        branches:
+            - master
+    workflow_dispatch:
+
+jobs:
+    test:
+        name: ${{ matrix.compiler.cc }}${{ matrix.compiler.sanitizer && ' asan+ubsan' || '' }}
+        runs-on: ubuntu-latest
+        container:
+            image: archlinux:latest
+        strategy:
+            fail-fast: false
+            matrix:
+                compiler:
+                    - {cc: gcc, cxx: g++}
+                    - {cc: gcc, cxx: g++, sanitizer: 'address,undefined'}
+                    - {cc: clang, cxx: clang++}
+                    - {cc: clang, cxx: clang++, sanitizer: 'address,undefined'}
+
+        steps:
+            - name: Set up C++ environment
+              run: |
+                pacman -Syu --noconfirm --disable-download-timeout
+                pacman -S --noconfirm --disable-download-timeout git cmake ninja base-devel ${{ matrix.compiler.cc == 'clang' && 'clang' || '' }}
+
+            - name: Checkout repository
+              uses: actions/checkout@v6
+
+            # A plain git clone rather than another actions/checkout: act cannot run a JS action for another repository
+            # in the bare archlinux container (no node). No submodules: only headers of src/ are used.
+            - name: Checkout Kvasir SDK
+              run: git clone --depth 1 https://github.com/kvasir-io/Kvasir_SDK.git "$GITHUB_WORKSPACE/../Kvasir_SDK"
+
+            - name: Configure CMake
+              run: >
+                cmake -S tests -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+                ${{ matrix.compiler.sanitizer && format('"-DCMAKE_CXX_FLAGS=-fsanitize={0} -fno-sanitize-recover=all"', matrix.compiler.sanitizer) || '' }}
+              env:
+                CC: ${{ matrix.compiler.cc }}
+                CXX: ${{ matrix.compiler.cxx }}
+
+            - name: Build tests
+              run: cmake --build build -j"$(nproc)"
+
+            - name: Run tests
+              run: ctest --test-dir build --output-on-failure

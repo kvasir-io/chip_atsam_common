@@ -5,11 +5,14 @@
 #include "chip/Io.hpp"
 #include "core/Nvic.hpp"
 #include "kvasir/Register/Register.hpp"
+#include "kvasir/Util/Prescaler.hpp"
 #include "kvasir/Util/using_literals.hpp"
 #include "peripherals/CAN.hpp"
 #include "uc_log/uc_log.hpp"
 
+#include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <optional>
 
 namespace Kvasir { namespace CAN {
@@ -79,6 +82,53 @@ namespace Kvasir { namespace CAN {
     static_assert(sizeof(CanFilter) == 4);
 
     namespace Detail {
+        /// The M_CAN's nominal bit timing (NBTP; SAM C20/C21 DS60001479 and D5x/E5x data sheets, CAN
+        /// NBTP): a time quantum is NBRP + 1 GCLK_CAN periods, a bit is 1 + (NTSEG1 + 1) + (NTSEG2
+        /// + 1) quanta, 4 to 385; NBRP 0..511, NTSEG1 1..255, NTSEG2 0..127, NSJW 0..127, each field
+        /// used as one more than written.
+        struct BitTiming {
+            std::uint32_t       nbrp{};
+            std::uint32_t       ntseg1{};
+            std::uint32_t       ntseg2{};
+            std::uint32_t       nsjw{};
+            Prescaler::Rational achieved{};
+            bool                found{};
+        };
+
+        /// The prescaler whose bit is closest to `baud` in rate, the smallest prescaler (most
+        /// quanta) on a tie; the sample point at `samplePointPermille` of the bit (sync segment
+        /// included), rounded to a quantum; the jump width as wide as phase segment 2. 8 MHz,
+        /// 500 kbit/s, 750 give the reset value 0x06000A03 (16 quanta, 12 before the sample point).
+        consteval BitTiming bitTiming(std::uint32_t clock,
+                                      std::uint32_t baud,
+                                      std::uint32_t samplePointPermille) {
+            BitTiming best{};
+            for(std::uint64_t pre = 1; pre <= 512; ++pre) {
+                std::uint64_t const quanta = (clock + pre * baud / 2) / (pre * baud);
+                if(quanta < 4 || quanta > 385) { continue; }
+                std::uint64_t const beforeSample = (quanta * samplePointPermille + 500) / 1000;
+                std::uint64_t const seg2 = std::clamp<std::uint64_t>(quanta - beforeSample, 1, 128);
+                std::uint64_t const seg1 = quanta - 1 - seg2;
+                if(seg1 < 2 || seg1 > 256) { continue; }
+                Prescaler::Rational const achieved{clock, pre * quanta};
+                auto const                error = [&](Prescaler::Rational const& r) {
+                    // |r - baud| * den, compared across candidates as |num - baud den| / den
+                    return r.num > baud * r.den ? r.num - baud * r.den : baud * r.den - r.num;
+                };
+                if(best.found
+                   && error(achieved) * best.achieved.den >= error(best.achieved) * achieved.den)
+                {
+                    continue;
+                }
+                best = BitTiming{.nbrp     = static_cast<std::uint32_t>(pre - 1),
+                                 .ntseg1   = static_cast<std::uint32_t>(seg1 - 1),
+                                 .ntseg2   = static_cast<std::uint32_t>(seg2 - 1),
+                                 .nsjw     = static_cast<std::uint32_t>(std::min(seg1, seg2) - 1),
+                                 .achieved = achieved,
+                                 .found    = true};
+            }
+            return best;
+        }
 
         template<unsigned CanInstance, typename RXPIN>
         struct GetRxPinConfig;
@@ -113,11 +163,20 @@ namespace Kvasir { namespace CAN {
                     }
                 }();
 
+                // the achieved bit rate against this (the bus needs every node within ~0.5 %)
                 static constexpr auto maxBaudRateError = [] {
                     if constexpr(requires { CANConfig_::maxBaudRateError; }) {
                         return CANConfig_::maxBaudRateError;
                     } else {
                         return std::ratio<1, 1000>{};
+                    }
+                }();
+                // where the bus is sampled, in 1/1000 of a bit; 750 is the reset value's
+                static constexpr std::uint32_t samplePointPermille = [] {
+                    if constexpr(requires { CANConfig_::samplePointPermille; }) {
+                        return CANConfig_::samplePointPermille;
+                    } else {
+                        return 750U;
                     }
                 }();
                 static constexpr auto rejectNonMatching = [] {
@@ -132,6 +191,24 @@ namespace Kvasir { namespace CAN {
             static constexpr auto Instance = CANConfig::instance;
             using Regs                     = Peripheral::CAN::Registers<Instance>;
             using InterruptIndexs = decltype(Traits::CanTraits::getCanIsrIndexs<Instance>());
+
+            // clockSpeed is GCLK_CAN's
+            static constexpr BitTiming Timing = bitTiming(CANConfig::clockSpeed,
+                                                          CANConfig::baudRate,
+                                                          CANConfig::samplePointPermille);
+            static_assert(Timing.found,
+                          "no CAN bit timing: baudRate needs 4 to 385 time quanta of 1 to 512 "
+                          "GCLK_CAN periods");
+            static constexpr bool BitRateInTolerance = [] {
+                Prescaler::assertInTolerance<Timing.achieved,
+                                             CANConfig::baudRate,
+                                             Prescaler::Tolerance{CANConfig::maxBaudRateError},
+                                             "CAN bit rate">();
+                return true;
+            }();
+            // a static data member of a class template is initialised only when used: this use
+            // is what runs the check
+            static_assert(BitRateInTolerance);
 
             static constexpr auto rejectConfig = []() {
                 if constexpr(CANConfig::rejectNonMatching) {
@@ -171,6 +248,12 @@ namespace Kvasir { namespace CAN {
               Register::SequencePoint{},
               set(Regs::CCCR::cce),
               Register::SequencePoint{},
+              // NBTP is writable only with CCCR.CCE and INIT set (NBTP, "Write-restricted")
+              Regs::NBTP::overrideDefaults(
+                write(Regs::NBTP::nbrp, Register::value<Timing.nbrp>()),
+                write(Regs::NBTP::ntseg1, Register::value<Timing.ntseg1>()),
+                write(Regs::NBTP::ntseg2, Register::value<Timing.ntseg2>()),
+                write(Regs::NBTP::nsjw, Register::value<Timing.nsjw>())),
               set(Regs::IE::rf0le),
               rejectConfig,
               //set(Regs::IE::rf0ne),

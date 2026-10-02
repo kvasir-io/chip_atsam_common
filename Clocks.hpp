@@ -28,6 +28,10 @@ namespace Kvasir { namespace Clocks {
     // GCLK_USB: 48 MHz +-0.25 % (SAM D21 datasheet DS40001882, 32.5.3).
     struct ClkUsb : ClockTag {};
 
+    // GCLK_MAIN: generic clock generator 0, the clock of the CPU and the buses (provided by the
+    // chip's ClockTree.hpp Tree next to Startup::ProcessorClock).
+    struct ClkMain : ClockTag {};
+
     template<typename Which, auto Hz>
     using Clk = Startup::Resource<Which, Hz>;
 
