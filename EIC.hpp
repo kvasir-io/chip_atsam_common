@@ -14,6 +14,7 @@
 //   - CONFIGn and EVCTRL are written while the EIC is disabled (D21 21.6.2.1, md 15036).
 //   - Spurious INTFLAG at enable (D21 errata 1.9.1, C21 errata 1.11.3): handled in EicBase.
 
+#include "chip/atsam_common/WaitBounds.hpp"
 #include "core/Nvic.hpp"
 #include "kvasir/Io/Types.hpp"
 #include "kvasir/Register/Register.hpp"
@@ -196,9 +197,11 @@ namespace Kvasir { namespace EIC {
         template<typename R>
         static void waitForSync() {
             if constexpr(requires { R::STATUS::syncbusy; }) {
-                while(apply(read(R::STATUS::syncbusy))) {}   // D21: STATUS.SYNCBUSY
+                Kvasir::Register::waitUntil<Kvasir::Chip::Sam::SyncBound>(
+                  Kvasir::Register::isClear(R::STATUS::syncbusy));   // D21: STATUS.SYNCBUSY
             } else {
-                while(apply(read(R::SYNCBUSY::enable))) {}   // C21/E5x: SYNCBUSY.ENABLE
+                Kvasir::Register::waitUntil<Kvasir::Chip::Sam::SyncBound>(
+                  Kvasir::Register::isClear(R::SYNCBUSY::enable));   // C21/E5x: SYNCBUSY.ENABLE
             }
         }
 

@@ -234,6 +234,24 @@ namespace Kvasir { namespace Sercom { namespace I2C { namespace Detail {
                 }
             }();
 
+            /// Tickets and cancel() (Sercom_I2CQueued's submitTracked/cancel; kvasir_devices BusTypes.hpp).
+            static constexpr bool cancellable = [] {
+                if constexpr(requires { I2CConfig_::cancellable; }) {
+                    return static_cast<bool>(I2CConfig_::cancellable);
+                } else {
+                    return false;
+                }
+            }();
+
+            /// Request::deadline: done by then, queue wait included, else timedOut.
+            static constexpr bool requestDeadlines = [] {
+                if constexpr(requires { I2CConfig_::requestDeadlines; }) {
+                    return static_cast<bool>(I2CConfig_::requestDeadlines);
+                } else {
+                    return false;
+                }
+            }();
+
             /// The slowest rate a device on this bus runs at: what the idle watchdog of
             /// LineRecovery scales its threshold with. Only perDeviceClock makes it differ.
             static constexpr std::uint32_t minBaudRate = [] {

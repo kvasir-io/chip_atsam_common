@@ -3,7 +3,8 @@
 #include "kvasir/Devices/RotaryEncoder.hpp"
 
 namespace Kvasir {
-/// A RotaryEncoder whose A pin is an EXTINT line (pull-up, the EIC's filter on) and whose B pin is
+/// A RotaryEncoder whose A pin is an EXTINT line (pull-up unless `pull` says otherwise, the EIC's
+/// filter on) and whose B pin is
 /// read in the edge callback. Listing it in Startup is all it takes: both pins, the line and its
 /// share of the EIC interrupt come with it (an EicBase has to be in the list too).
 ///
@@ -13,6 +14,7 @@ namespace Kvasir {
 /// per detent. One that does a whole cycle per detent pulses A once per click; both edges then
 /// count the click twice, and the second, a few ms after the first, is taken for fast turning
 /// by the acceleration curve - give it EdgeFall or EdgeRise. B tells the direction on either.
+/// `pull` (Io::PullConfiguration, PullUp) is PinA's pull; PinB is a plain input either way.
 /// A wrapper that wants its own edge callback takes `EicLineWith<&itsCallback>` as its SubIsrs.
 template<typename Clock, typename PinA, typename PinB, typename ValueType, typename Config_>
 struct SamRotaryEncoder : Kvasir::RotaryEncoder<Clock, PinA, PinB, ValueType, Config_> {
@@ -35,15 +37,21 @@ struct SamRotaryEncoder : Kvasir::RotaryEncoder<Clock, PinA, PinB, ValueType, Co
       "SamRotaryEncoder: the config needs eicPriority, the NVIC priority of the EIC "
       "interrupt");
 
+    // PullUp unless the config says otherwise: PullNone or PullDown for a line with an external
+    // pull resistor, which the 20-60 k internal pull-up (SAM C21 DS60001479M RPULL md l.50199)
+    // would otherwise fight.
+    static constexpr auto pull = [] {
+        if constexpr(requires { Config_::pull; }) {
+            return Config_::pull;
+        } else {
+            return Kvasir::Io::PullConfiguration::PullUp;
+        }
+    }();
+
     template<auto Callback>
-    using EicLineWith = Kvasir::EIC::ExtInt<PinA,
-                                            edge,
-                                            Callback,
-                                            static_cast<int>(Config_::eicPriority),
-                                            Kvasir::Io::PullConfiguration::PullUp,
-                                            true,
-                                            false>;
-    using EicLine     = EicLineWith<&Base::edgeCallback>;
+    using EicLineWith = Kvasir::EIC::
+      ExtInt<PinA, edge, Callback, static_cast<int>(Config_::eicPriority), pull, true, false>;
+    using EicLine = EicLineWith<&Base::edgeCallback>;
 
     using Provides = typename EicLine::Provides;
     using Claims   = typename EicLine::Claims;

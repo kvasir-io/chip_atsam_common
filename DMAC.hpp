@@ -3,9 +3,13 @@
 #include "chip/PM.hpp"
 #include "kvasir/Register/Register.hpp"
 #include "kvasir/Register/Utility.hpp"
+#include "kvasir/Util/Crc.hpp"
 #include "peripherals/DMAC.hpp"
 
+#include <cstddef>
 #include <cstdint>
+#include <span>
+#include <type_traits>
 
 namespace Kvasir {
 namespace DMAC {
@@ -238,6 +242,32 @@ namespace DMAC {
             return stop<Channel, Regs>();
         }
 
+        // A disabled channel finishes its beat and its write-back first: CHCTRLA.ENABLE reads 1
+        // until then (DS40001882L 20.6.3.6, 20.8.18; C21 DS60001479 and E5x DS60001507 say the
+        // same). A few bus cycles; hitting this bound means the channel is wedged.
+        static constexpr int StopPollLimit = 10000;
+
+        /// stop(), then wait until the channel really is off, so a following start() or a
+        /// peripheral reset does not race the last beat. Returns false if it never was.
+        template<DMAChannel Channel,
+                 typename Regs_t = Regs>
+        static bool stopAndWait() {
+            apply(stop<Channel, Regs_t>());
+            for(int i = 0; i < StopPollLimit; ++i) {
+                if constexpr(Traits::DmacTraits::OldImpl) {
+                    apply(write(
+                      Regs_t::CHID::id,
+                      Kvasir::Register::value<std::uint8_t, static_cast<std::uint8_t>(Channel)>()));
+                    if(apply(read(Regs_t::CHCTRLA::enable)) == 0) { return true; }
+                } else {
+                    using CHRegs =
+                      typename Regs_t::template CHANNEL<static_cast<std::size_t>(Channel)>;
+                    if(apply(read(CHRegs::CHCTRLA::enable)) == 0) { return true; }
+                }
+            }
+            return false;
+        }
+
         enum class ChannelEvent : std::uint8_t { none, complete, error };
 
         /// Reads and clears CHINTFLAG TERR/TCMPL; set even with the interrupt off (DS40001882L
@@ -355,6 +385,37 @@ namespace CRC {
         return calcCrc<Crc>(reinterpret_cast<std::uint8_t const*>(&v),
                             reinterpret_cast<std::uint8_t const*>(&v + 1));
     }
+
+    /// The `type` + `calc(span)` shape (Kvasir::Crc::Calc's) over the DMAC's CRC engine, for the
+    /// two Kvasir::Crc presets it computes: CRC-16 polynomial 0x1021 and CRC-32 0x04C11DB7, both
+    /// seeded with all ones above, the CRC-32 checksum read bit-reversed and complemented (SAM D21
+    /// DS40001882 20.6.3.7 and Figure 20-16) - CRC-16/IBM-3740 and CRC-32/ISO-HDLC. Any other
+    /// preset does not compile. Not yet compared with the software engine on a board.
+    template<auto P>
+    struct DmacCalc {
+        using type = std::remove_cvref_t<decltype(P.poly)>;
+
+        static constexpr bool Crc16 = P.width == Kvasir::Crc::Presets::crc16Ibm3740.width
+                                   && P.poly == Kvasir::Crc::Presets::crc16Ibm3740.poly
+                                   && P.init == Kvasir::Crc::Presets::crc16Ibm3740.init
+                                   && P.refin == Kvasir::Crc::Presets::crc16Ibm3740.refin
+                                   && P.refout == Kvasir::Crc::Presets::crc16Ibm3740.refout
+                                   && P.xorout == Kvasir::Crc::Presets::crc16Ibm3740.xorout;
+        static constexpr bool Crc32 = P.width == Kvasir::Crc::Presets::crc32IsoHdlc.width
+                                   && P.poly == Kvasir::Crc::Presets::crc32IsoHdlc.poly
+                                   && P.init == Kvasir::Crc::Presets::crc32IsoHdlc.init
+                                   && P.refin == Kvasir::Crc::Presets::crc32IsoHdlc.refin
+                                   && P.refout == Kvasir::Crc::Presets::crc32IsoHdlc.refout
+                                   && P.xorout == Kvasir::Crc::Presets::crc32IsoHdlc.xorout;
+        static_assert(Crc16 || Crc32,
+                      "the DMAC computes CRC-16/IBM-3740 and CRC-32/ISO-HDLC only");
+
+        static type calc(std::span<std::byte const> data) {
+            auto const* const first = reinterpret_cast<std::uint8_t const*>(data.data());
+            return static_cast<type>(
+              calcCrc<Crc16 ? CRC_Type::crc16 : CRC_Type::crc32>(first, first + data.size()));
+        }
+    };
 
 }   // namespace CRC
 

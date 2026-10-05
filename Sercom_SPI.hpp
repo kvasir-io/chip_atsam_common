@@ -450,8 +450,8 @@ namespace Kvasir { namespace Sercom { namespace SPI {
         /// Abandon an in-flight transfer: stop both DMA channels, forget them, and drop what
         /// the receiver holds so it is not read as the start of the next transfer.
         static void abortTransfer() {
-            apply(Dma::template stop<DmaChannelA>());
-            apply(Dma::template stop<DmaChannelB>());
+            static_cast<void>(Dma::template stopAndWait<DmaChannelA>());
+            static_cast<void>(Dma::template stopAndWait<DmaChannelB>());
             a = false;
             b = false;
             for(int i = 0; i < 4 && apply(read(Regs::INTFLAG::rxc)); ++i) {

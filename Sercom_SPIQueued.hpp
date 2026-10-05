@@ -4,6 +4,7 @@
 // Section numbers refer to DS40001882L (SAM D21).
 #include "chip/atsam_common/DMAC.hpp"
 #include "chip/atsam_common/Sercom_SPI.hpp"
+#include "chip/atsam_common/WaitBounds.hpp"
 #include "kvasir/Atomic/Atomic.hpp"
 #include "kvasir/Devices/Quantities.hpp"
 #include "kvasir/Devices/SPI/QueueCore.hpp"
@@ -66,6 +67,7 @@ namespace Kvasir { namespace Sercom { namespace SPI {
             std::uint32_t ctrla{};
             bool          active{};
             std::uint32_t shifterWaitsExhausted{};
+            std::uint32_t dmaStopsExhausted{};
         };
 
         struct Hw {
@@ -166,8 +168,9 @@ namespace Kvasir { namespace Sercom { namespace SPI {
             }
 
             static void abort() {
-                apply(Dma::template stop<TxChannel>());
-                apply(Dma::template stop<RxChannel>());
+                bool const txOff = Dma::template stopAndWait<TxChannel>();
+                bool const rxOff = Dma::template stopAndWait<RxChannel>();
+                if(!txOff || !rxOff) { ++dmaStopsExhausted_; }
                 active_ = false;
                 // Let queued characters finish (TXC, 27.6.2.6.1), bounded.
                 bool idle = false;
@@ -186,7 +189,8 @@ namespace Kvasir { namespace Sercom { namespace SPI {
             static void reinit() {
                 abort();
                 apply(set(Regs::CTRLA::swrst));
-                while(apply(read(Regs::SYNCBUSY::swrst)) != 0) {}
+                Kvasir::Register::waitUntil<Kvasir::Chip::Sam::SyncBound>(
+                  Kvasir::Register::isClear(Regs::SYNCBUSY::swrst));
                 apply(base::initStepPeripheryConfig);
                 apply(base::initStepPeripheryEnable);
                 waitEnableSync_();
@@ -199,6 +203,7 @@ namespace Kvasir { namespace Sercom { namespace SPI {
                   .ctrla                 = get<0>(apply(read(Regs::CTRLA::FULLREGISTER))),
                   .active                = active_,
                   .shifterWaitsExhausted = shifterWaitsExhausted_,
+                  .dmaStopsExhausted     = dmaStopsExhausted_,
                 };
             }
 
@@ -206,14 +211,15 @@ namespace Kvasir { namespace Sercom { namespace SPI {
                 UC_LOG_W(
                   "sercom{} spi at the timeout: INTFLAG {:#04x}, STATUS {:#06x}, CTRLA "
                   "{:#010x}, {}, {} DMA error(s) so far, {} abort(s) with the transmitter "
-                  "never done",
+                  "never done, {} with a DMA channel that never stopped",
                   Instance,
                   s.intflag,
                   s.status,
                   s.ctrla,
                   std::string_view{s.active ? "DMA armed" : "nothing armed"},
                   dmaErrors_,
-                  s.shifterWaitsExhausted);
+                  s.shifterWaitsExhausted,
+                  s.dmaStopsExhausted);
             }
 
             static std::uint32_t dmaErrors() { return dmaErrors_; }
@@ -226,9 +232,11 @@ namespace Kvasir { namespace Sercom { namespace SPI {
             inline static bool          enabled_{};
             inline static std::uint32_t dmaErrors_{};
             inline static std::uint32_t shifterWaitsExhausted_{};
+            inline static std::uint32_t dmaStopsExhausted_{};
 
             static void waitEnableSync_() {
-                while(apply(read(Regs::SYNCBUSY::enable)) != 0) {}
+                Kvasir::Register::waitUntil<Kvasir::Chip::Sam::SyncBound>(
+                  Kvasir::Register::isClear(Regs::SYNCBUSY::enable));
             }
         };
 
@@ -236,6 +244,21 @@ namespace Kvasir { namespace Sercom { namespace SPI {
         using Request = typename Core::RequestT;
 
         static bool submit(Request const& r) { return Core::submit(r); }
+
+        /// QueueCoreFeatures::cancel / ::deadlines (kvasir_devices BusTypes.hpp): a ticket, and cancel(ticket).
+        using Result = typename Core::Result;
+
+        static Bus::Ticket submitTracked(Request const& r)
+            requires(Core::Tracked)
+        {
+            return Core::submitTracked(r);
+        }
+
+        static Bus::Cancel cancel(Bus::Ticket t)
+            requires(Core::Features.cancel)
+        {
+            return Core::cancel(t);
+        }
 
         static void releaseHold(Kvasir::SPI::Lines const& l) { Core::releaseHold(l); }
 

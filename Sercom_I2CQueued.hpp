@@ -2,6 +2,7 @@
 
 #include "Sercom_I2C.hpp"
 #include "kvasir/Atomic/Queue.hpp"
+#include "kvasir/Devices/BusTypes.hpp"
 #include "kvasir/Devices/I2C/LineRecovery.hpp"
 #include "kvasir/Register/Apply.hpp"
 #include "kvasir/StartUp/Hooks.hpp"
@@ -61,6 +62,58 @@ namespace Kvasir { namespace Sercom { namespace I2C {
     /// left off: they run from GCLK_SERCOM_SLOW, which "must be configured to use a 32KHz
     /// oscillator" (28.6.3.1) - a clock this driver cannot ask every firmware for.
     enum class I2CRequestResult : std::uint8_t { failed, notAcknowledged, succeeded };
+
+    /// The result on a bus with `cancellable` or `requestDeadlines`: the first three as I2CRequestResult.
+    enum class I2CRequestResultTracked : std::uint8_t {
+        failed,
+        notAcknowledged,
+        succeeded,
+        cancelled,
+        timedOut
+    };
+
+    /// The request of a bus with `cancellable` / `requestDeadlines` (kvasir_devices BusTypes.hpp): I2CRequest's
+    /// fields with the tracked result, a ticket, the tombstone flag and an optional deadline. A type of its own, so a
+    /// bus without the features keeps I2CRequest and its names.
+    template<std::size_t CallbackSize, typename TimePoint, bool Deadlines>
+    struct I2CTrackedRequest {
+        static constexpr std::size_t MaxPrefix = 2;
+
+        std::uint8_t                                                address{};
+        std::uint8_t                                                prefixBytes{};
+        std::array<std::byte, MaxPrefix>                            prefix{};
+        std::span<std::byte const>                                  sendData{};
+        std::span<std::byte>                                        receiveData{};
+        StaticFunction<void(I2CRequestResultTracked), CallbackSize> callback{};
+        std::uint16_t                                               ticket{};
+        bool                                                        cancelled{};
+        [[no_unique_address]] Kvasir::I2C::detail::IfFeature<Deadlines, TimePoint, 30> deadline{
+          TimePoint::max()};
+
+        template<std::integral... B>
+            requires(sizeof...(B) <= MaxPrefix)
+        constexpr void setPrefix(B... b) {
+            prefix      = {std::byte{static_cast<std::uint8_t>(b)}...};
+            prefixBytes = sizeof...(B);
+        }
+
+        [[nodiscard]] constexpr std::size_t sendBytes() const {
+            return prefixBytes + sendData.size();
+        }
+
+        [[nodiscard]] constexpr std::byte sendByte(std::size_t i) const {
+            return i < prefixBytes ? prefix[i] : sendData[i - prefixBytes];
+        }
+    };
+
+    template<std::size_t CallbackSize,
+             typename TimePoint,
+             bool Deadlines,
+             typename Timing,
+             Timing BusDefault>
+    struct I2CTimedTrackedRequest : I2CTrackedRequest<CallbackSize, TimePoint, Deadlines> {
+        Timing timing{BusDefault};
+    };
 
     template<std::size_t CallbackSize>
     struct I2CRequest {
@@ -130,8 +183,13 @@ namespace Kvasir { namespace Sercom { namespace I2C {
         using base     = Detail::I2CBase<I2CConfig>;
         using Regs     = typename base::Regs;
         using tp       = typename Clock::time_point;
-        using Result   = I2CRequestResult;
         using Recovery = Kvasir::I2C::LineRecovery<base, Clock>;
+
+        /// Tickets / cancel() and per-request deadlines (I2CConfig::cancellable, ::requestDeadlines).
+        static constexpr bool Cancellable = base::I2CConfig::cancellable;
+        static constexpr bool Deadlines   = base::I2CConfig::requestDeadlines;
+        static constexpr bool Tracked     = Cancellable || Deadlines;
+        using Result = std::conditional_t<Tracked, I2CRequestResultTracked, I2CRequestResult>;
 
         /// Each device at its own clock (I2CConfig::perDeviceClock). Off, a request has no
         /// timing member and startNext_() never looks at BAUD: nothing of this is in the image.
@@ -149,10 +207,15 @@ namespace Kvasir { namespace Sercom { namespace I2C {
                 return ClockTiming{};
             }
         }();
-        using Request
-          = std::conditional_t<PerDeviceClock,
-                               I2CTimedRequest<CallbackSize, ClockTiming, DefaultTiming>,
-                               I2CRequest<CallbackSize>>;
+        using Request = std::conditional_t<
+          Tracked,
+          std::conditional_t<
+            PerDeviceClock,
+            I2CTimedTrackedRequest<CallbackSize, tp, Deadlines, ClockTiming, DefaultTiming>,
+            I2CTrackedRequest<CallbackSize, tp, Deadlines>>,
+          std::conditional_t<PerDeviceClock,
+                             I2CTimedRequest<CallbackSize, ClockTiming, DefaultTiming>,
+                             I2CRequest<CallbackSize>>>;
 
         /// What a request carries for a device clocked at most at `hz` (kvasir_devices'
         /// Device fills it in from Config::BusClock / Chip::I2cMaxClock): BAUD for
@@ -217,6 +280,46 @@ namespace Kvasir { namespace Sercom { namespace I2C {
             return true;
         }
 
+        /// submit(), with a ticket for cancel(); an invalid ticket (refused, no callback) when submit() would be false.
+        static Bus::Ticket submitTracked(Request req)
+            requires(Tracked)
+        {
+            apply(Nvic::makeDisable(typename base::InterruptIndexs{}));
+            req.ticket = Bus::nextTicket(ticketCounter_);
+            if(!resetting_) { apply(Nvic::makeEnable(typename base::InterruptIndexs{})); }
+            return submit(req) ? Bus::Ticket{req.ticket} : Bus::Ticket{};
+        }
+
+        /// removed: queued, never started - its callback (cancelled) ran before this returns. stopping: on the
+        /// wire - the SERCOM takes a command only while MB or SB is set (D21 md l.23999, C21 md l.28087), so the
+        /// interrupt at the next byte boundary issues NACK + STOP and completes it (cancelled); its buffers belong
+        /// to the bus until then. A byte boundary that never comes is the transfer timeout's (SWRST). tooLate:
+        /// completed already, or an unknown ticket.
+        static Bus::Cancel cancel(Bus::Ticket t)
+            requires(Cancellable)
+        {
+            if(!t.valid()) { return Bus::Cancel::tooLate; }
+            apply(Nvic::makeDisable(typename base::InterruptIndexs{}));
+            auto r = Bus::Cancel::tooLate;
+            if(active_ && currentRequest_.ticket == t.id) {
+                if(!cancelPending_) {
+                    cancelPending_ = true;
+                    stopAs_        = Result::cancelled;
+                }
+                r = Bus::Cancel::stopping;
+            } else {
+                requestQueue_.forEachQueued([&](Request& q) {
+                    if(q.ticket == t.id && !q.cancelled) {
+                        q.cancelled = true;
+                        if(q.callback) { q.callback(Result::cancelled); }
+                        r = Bus::Cancel::removed;
+                    }
+                });
+            }
+            if(!resetting_) { apply(Nvic::makeEnable(typename base::InterruptIndexs{})); }
+            return r;
+        }
+
         /// Once per main-loop turn per bus. Owns the timeout, the recovery's clock, the
         /// dead-bus watchdog, and restarts the queue if a submit happened to lose the race
         /// with a completing transfer.
@@ -251,12 +354,16 @@ namespace Kvasir { namespace Sercom { namespace I2C {
             // What the ISR writes too, taken in one go with its interrupt masked.
             apply(Nvic::makeDisable(typename base::InterruptIndexs{}));
             auto const droppedFaults = faultLog_.takeSummary(now);
+            auto const droppedNaks   = nakLog_.takeSummary(now);
             bool const deadBus       = consecutiveFailures_ >= kDeadBusFailures;
             if(deadBus) { consecutiveFailures_ = 0; }
             bool const settled = Recovery::isPastSettle(now);
             apply(Nvic::makeEnable(typename base::InterruptIndexs{}));
             if(droppedFaults != 0) {
                 UC_LOG_W("i2c{} +{} faults not logged", base::Instance, droppedFaults);
+            }
+            if(droppedNaks != 0) {
+                UC_LOG_D("i2c{} +{} address NAKs not logged", base::Instance, droppedNaks);
             }
 
             // Dead-bus watchdog: line-state checks miss failures on a healthy wire, so this
@@ -284,6 +391,12 @@ namespace Kvasir { namespace Sercom { namespace I2C {
 
             // Post-abort settle: the bus was sick, wait before starting the next transaction
             if(!settled) { return; }
+
+            if constexpr(Deadlines) {
+                apply(Nvic::makeDisable(typename base::InterruptIndexs{}));
+                expireDeadlines_(now);
+                apply(Nvic::makeEnable(typename base::InterruptIndexs{}));
+            }
 
             // Nothing active: a stuck SDA is looked for on every idle turn, not only when a
             // request waits, because a stuck bus parks every device as absent and that
@@ -320,7 +433,8 @@ namespace Kvasir { namespace Sercom { namespace I2C {
                     // The block may be anywhere in a byte with the clock held: only the
                     // software reset is sure to let go of the lines (see the header).
                     reinit_(false);
-                    complete_(Result::failed);
+                    // a stop the caller asked for (cancel, deadline) whose byte boundary never came: that outcome
+                    complete_(stoppingResult_(Result::failed));
                 }
                 apply(Nvic::makeEnable(typename base::InterruptIndexs{}));
             }
@@ -494,20 +608,43 @@ namespace Kvasir { namespace Sercom { namespace I2C {
                 return;
             }
 
+            // our own stop (cancel, deadline), taken at this byte boundary: NACK + STOP, not a fault. A NAK or a
+            // bus error that came first keeps its own result (below).
+            if constexpr(Tracked) {
+                if(cancelPending_ && !error && !rxnack && (mb || sb)) {
+                    apply(nack_stop);
+                    complete_(stopAs_);
+                    return;
+                }
+            }
+
             if(error || (mb && rxnack)) {
                 // rxnack alone is the device not answering, which is what tells a driver the
                 // part is absent; anything else is a bus fault and says nothing about it.
                 bool const isNak = rxnack && !error;
-                KVASIR_LOG_LIMITED(faultLog_.allow(faultKey_(
-                                     state_ == State::sending ? Fault::abortSend : Fault::abortRecv,
-                                     status)),
-                                   UC_LOG_W,
-                                   "i2c{} abort {} addr={:#04x} STATUS {:#06x}{}",
-                                   base::Instance,
-                                   std::string_view{state_ == State::sending ? "send" : "recv"},
-                                   currentRequest_.address,
-                                   status,
-                                   std::string_view{isNak ? " (NAK)" : ""});
+                // The address NAKed (before the first data byte, or the read phase's address: a
+                // host never receives a NAK for data) is an answer - nobody there, every probe of a
+                // scan - not a fault: debug, and not on the faults' budget. A known part that stops
+                // answering is Presence's warning; a NAK of a data byte stays a warning.
+                bool const addressNak = isNak && (state_ == State::receiving || sendIndex_ == 0);
+                auto const fault = state_ == State::sending ? Fault::abortSend : Fault::abortRecv;
+                if(addressNak) {
+                    KVASIR_LOG_LIMITED(nakLog_.allow(faultKey_(fault, status)),
+                                       UC_LOG_D,
+                                       "i2c{} {} addr={:#04x}: no ACK, nobody there",
+                                       base::Instance,
+                                       std::string_view{state_ == State::sending ? "send" : "recv"},
+                                       currentRequest_.address);
+                } else {
+                    KVASIR_LOG_LIMITED(faultLog_.allow(faultKey_(fault, status)),
+                                       UC_LOG_W,
+                                       "i2c{} abort {} addr={:#04x} STATUS {:#06x}{}",
+                                       base::Instance,
+                                       std::string_view{state_ == State::sending ? "send" : "recv"},
+                                       currentRequest_.address,
+                                       status,
+                                       std::string_view{isNak ? " (NAK)" : ""});
+                }
                 // A STOP, which also clears MB/SB and lets go of the clock. Without the bus
                 // (arbitration lost) the command does nothing, so the flags are written too.
                 apply(nack_stop);
@@ -683,6 +820,7 @@ namespace Kvasir { namespace Sercom { namespace I2C {
         /// Finish the running request, hand the result to its callback, then start whatever
         /// the callback (or anyone else) queued behind it. Interrupt masked, or in the ISR.
         static void complete_(Result r) {
+            if constexpr(Tracked) { cancelPending_ = false; }
             active_ = false;
             state_  = State::idle;
 
@@ -743,9 +881,29 @@ namespace Kvasir { namespace Sercom { namespace I2C {
         }
 
         static void startNext_() {
-            if(requestQueue_.empty()) { return; }
-            currentRequest_ = requestQueue_.front();
-            requestQueue_.pop();
+            if constexpr(!Tracked) {
+                if(requestQueue_.empty()) { return; }
+                currentRequest_ = requestQueue_.front();
+                requestQueue_.pop();
+            } else {
+                while(true) {
+                    if(requestQueue_.empty()) { return; }
+                    currentRequest_ = requestQueue_.front();
+                    requestQueue_.pop();
+                    if(currentRequest_.cancelled) { continue; }   // a tombstone: dropped
+                    if constexpr(Deadlines) {
+                        if(Clock::now()
+                           > currentRequest_.deadline) {   // out of time before it started
+                            ++drainedRequests_;
+                            if(currentRequest_.callback) {
+                                currentRequest_.callback(Result::timedOut);
+                            }
+                            continue;
+                        }
+                    }
+                    break;
+                }
+            }
 
             sendIndex_     = 0;
             receivedCount_ = 0;
@@ -784,9 +942,42 @@ namespace Kvasir { namespace Sercom { namespace I2C {
             while(!requestQueue_.empty()) {
                 auto req = requestQueue_.front();
                 requestQueue_.pop();
+                if constexpr(Tracked) {
+                    if(req.cancelled) { continue; }   // a tombstone: its callback has run
+                }
                 ++drainedRequests_;
                 if(req.callback) { req.callback(Result::failed); }
             }
+        }
+
+        // only odr-used (so only defined) on a tracked bus
+        inline static std::uint16_t ticketCounter_{};
+        inline static bool          cancelPending_{};   // stop at the next byte boundary
+        inline static Result        stopAs_{};   // cancelled or timedOut, for that completion
+
+        static Result stoppingResult_(Result otherwise) {
+            if constexpr(Tracked) {
+                if(cancelPending_) { return stopAs_; }
+            }
+            return otherwise;
+        }
+
+        /// Interrupt masked: the request on the wire past its deadline stops at the next byte boundary
+        /// (timedOut); queued ones past theirs become tombstones with their callback (timedOut).
+        static void expireDeadlines_(tp now)
+            requires(Deadlines)
+        {
+            if(active_ && !cancelPending_ && now > currentRequest_.deadline) {
+                cancelPending_ = true;
+                stopAs_        = Result::timedOut;
+            }
+            requestQueue_.forEachQueued([&](Request& q) {
+                if(!q.cancelled && now > q.deadline) {
+                    q.cancelled = true;
+                    ++drainedRequests_;
+                    if(q.callback) { q.callback(Result::timedOut); }
+                }
+            });
         }
 
         inline static Kvasir::Atomic::Queue<Request, QueueDepth> requestQueue_{};
@@ -804,6 +995,8 @@ namespace Kvasir { namespace Sercom { namespace I2C {
         inline static std::uint32_t resuscitations_{};
         // Fault logging goes through this: a bad bus faults on every transaction.
         inline static Kvasir::RateLimiter<Clock> faultLog_{};
+        // address NAKs (debug): apart, so a scan does not spend the faults' budget and summary
+        inline static Kvasir::LogRateLimiter<Clock> nakLog_{};
 
         inline static std::uint32_t   spuriousIsr_{};
         inline static std::uint32_t   isrEntries_{};
