@@ -566,13 +566,28 @@ namespace Kvasir { namespace Sercom { namespace I2C {
             std::uint32_t isrGapUs{};
         };
 
+        // The interrupt keeps its waits in the clock's own ticks, 32 bits, saturated (2^32 ticks
+        // are 28 s or more: "very long" for a latency). They become microseconds where they
+        // are read: in the handler that was a 64-bit division per interrupt.
+        static constexpr std::uint32_t ticks32_(typename Clock::duration d) {
+            auto const n = static_cast<std::uint64_t>(d.count());
+            return n > 0xFFFF'FFFFU ? 0xFFFF'FFFFU : static_cast<std::uint32_t>(n);
+        }
+
+        static constexpr std::uint32_t usOfTicks_(std::uint32_t ticks) {
+            return static_cast<std::uint32_t>(
+              std::chrono::duration_cast<std::chrono::microseconds>(typename Clock::duration{ticks})
+                .count());
+        }
+
         static Latency takeLatency() {
             apply(Nvic::makeDisable(typename base::InterruptIndexs{}));
-            Latency const l{longestFirstIsrUs_, longestIsrGapUs_};
-            longestFirstIsrUs_ = 0;
-            longestIsrGapUs_   = 0;
+            std::uint32_t const first = longestFirstIsrTicks_;
+            std::uint32_t const gap   = longestIsrGapTicks_;
+            longestFirstIsrTicks_     = 0;
+            longestIsrGapTicks_       = 0;
             apply(Nvic::makeEnable(typename base::InterruptIndexs{}));
-            return l;
+            return Latency{usOfTicks_(first), usOfTicks_(gap)};
         }
 
         // INTFLAG.MB and SB are cleared by the next operation itself -- a write of ADDR or
@@ -582,12 +597,9 @@ namespace Kvasir { namespace Sercom { namespace I2C {
         // transfer would stand until its timeout. Only ERROR needs the write.
         static void onIsr() {
             {
-                auto const now    = Clock::now();
-                auto const waited = static_cast<std::uint32_t>(
-                  std::chrono::duration_cast<std::chrono::microseconds>(
-                    now - (isrEntries_ == 0 ? requestStart_ : lastIsr_))
-                    .count());
-                auto& longest = isrEntries_ == 0 ? longestFirstIsrUs_ : longestIsrGapUs_;
+                auto const now     = Clock::now();
+                auto const waited  = ticks32_(now - (isrEntries_ == 0 ? requestStart_ : lastIsr_));
+                auto&      longest = isrEntries_ == 0 ? longestFirstIsrTicks_ : longestIsrGapTicks_;
                 if(active_ && waited > longest) { longest = waited; }
                 ++isrEntries_;
                 lastIsr_ = now;
@@ -1002,8 +1014,8 @@ namespace Kvasir { namespace Sercom { namespace I2C {
         inline static std::uint32_t   isrEntries_{};
         inline static tp              lastIsr_{};
         inline static tp              requestStart_{};
-        inline static std::uint32_t   longestFirstIsrUs_{};
-        inline static std::uint32_t   longestIsrGapUs_{};
+        inline static std::uint32_t   longestFirstIsrTicks_{};
+        inline static std::uint32_t   longestIsrGapTicks_{};
         inline static std::uint32_t   timeouts_{};
         inline static std::uint32_t   transfers_{};   // countTransfers only: never used without it
         inline static std::uint32_t   sdaLowAfterAbort_{};

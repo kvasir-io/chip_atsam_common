@@ -11,6 +11,9 @@
 
 namespace Kvasir {
 namespace detail {
+    // A 32-bit word that may alias any object: the emulation's flash pages and their images in RAM are read and
+    // written word by word, and gcc's -Wstrict-aliasing rejects a plain std::uint32_t lvalue over them.
+    using AliasedWord [[gnu::may_alias]] = std::uint32_t;
 
     template<typename Clock>
     static constexpr void waitForReady() {
@@ -61,13 +64,15 @@ namespace detail {
                 if(currentAddress % RowSize == 0) { clearRow<Clock, isMainFlash>(currentAddress); }
 
                 if constexpr(WriteSize == RowSize) {
-                    writeRow<isMainFlash>(currentAddress,
-                                          reinterpret_cast<std::uint32_t const*>(start),
-                                          reinterpret_cast<std::uint32_t const*>(end));
+                    writeRow<isMainFlash>(
+                      currentAddress,
+                      reinterpret_cast<::Kvasir::detail::AliasedWord const*>(start),
+                      reinterpret_cast<::Kvasir::detail::AliasedWord const*>(end));
                 } else {
-                    writePage<isMainFlash>(currentAddress,
-                                           reinterpret_cast<std::uint32_t const*>(start),
-                                           reinterpret_cast<std::uint32_t const*>(end));
+                    writePage<isMainFlash>(
+                      currentAddress,
+                      reinterpret_cast<::Kvasir::detail::AliasedWord const*>(start),
+                      reinterpret_cast<::Kvasir::detail::AliasedWord const*>(end));
                 }
 
                 currentAddress += size;
@@ -204,7 +209,7 @@ namespace detail {
             std::uint16_t crc{};
         };
 
-        [[gnu::section(".eeprom")]] static inline ValueStruct flashValue{};
+        [[KVASIR_SECTION_MEMBER(".eeprom")]] static inline ValueStruct flashValue{};
 
         static inline T    ramCopy{};
         static inline bool valueRead{false};
@@ -231,8 +236,8 @@ namespace detail {
 
             Kvasir::Flash<Clock>::template clearAndWriteRow<isMainFlash>(
               reinterpret_cast<std::uint32_t>(&flashValue),
-              reinterpret_cast<std::uint32_t const*>(&newV),
-              reinterpret_cast<std::uint32_t const*>(&newV + 1));
+              reinterpret_cast<::Kvasir::detail::AliasedWord const*>(&newV),
+              reinterpret_cast<::Kvasir::detail::AliasedWord const*>(&newV + 1));
         }
 
         static void writeValue() {
@@ -320,7 +325,7 @@ namespace detail {
         static_assert(std::alignment_of_v<RowStruct> == pageSize * pagesPerRow,
                       "bla");
 
-        [[gnu::section(".eeprom")]] static inline std::array<RowStruct, rowToUse> rows{};
+        [[KVASIR_SECTION_MEMBER(".eeprom")]] static inline std::array<RowStruct, rowToUse> rows{};
 
         static constexpr blockType blockFromIndex(std::size_t index) {
             assert(index == std::clamp<decltype(index)>(index, 0, numTypes));
@@ -406,7 +411,9 @@ namespace detail {
 
         static bool pageCleared(PageStruct const* p) {
             for(std::size_t i = 0; i < pageSize / 4; ++i) {
-                if(*(reinterpret_cast<std::uint32_t const*>(p) + i) != 0xffffffff) { return false; }
+                if(*(reinterpret_cast<::Kvasir::detail::AliasedWord const*>(p) + i) != 0xffffffff) {
+                    return false;
+                }
             }
             return true;
         }
@@ -431,7 +438,7 @@ namespace detail {
                 waitForReady<Clock>();
 
                 for(std::size_t i = 0; i < pageSize / 4; ++i) {
-                    *(reinterpret_cast<std::uint32_t*>(p) + i) = 0;
+                    *(reinterpret_cast<::Kvasir::detail::AliasedWord*>(p) + i) = 0;
                 }
 
                 waitForReady<Clock>();
@@ -459,8 +466,8 @@ namespace detail {
                 waitForReady<Clock>();
 
                 for(std::size_t i = 0; i < pageSize / 4; ++i) {
-                    *(reinterpret_cast<std::uint32_t*>(p) + i)
-                      = *(reinterpret_cast<std::uint32_t const*>(&newp) + i);
+                    *(reinterpret_cast<::Kvasir::detail::AliasedWord*>(p) + i)
+                      = *(reinterpret_cast<::Kvasir::detail::AliasedWord const*>(&newp) + i);
                 }
 
                 if constexpr(isMainFlash) {
@@ -559,7 +566,7 @@ namespace detail {
             std::array<Record, NumPages> pages;
         };
 
-        [[gnu::section(".eeprom")]] static inline Storage storage{};
+        [[KVASIR_SECTION_MEMBER(".eeprom")]] static inline Storage storage{};
 
         static inline bool          scanned{false};
         static inline std::size_t   newest{NumPages};   ///< NumPages: none
@@ -594,7 +601,7 @@ namespace detail {
         }
 
         static bool erased(Record const& r) {
-            auto const* words = reinterpret_cast<std::uint32_t const*>(&r);
+            auto const* words = reinterpret_cast<::Kvasir::detail::AliasedWord const*>(&r);
             for(std::size_t i{}; i < pageSize / 4; ++i) {
                 if(words[i] != Erased) { return false; }
             }
@@ -624,8 +631,8 @@ namespace detail {
 
             Flash<Clock, pageSize, pagesPerRow>::template writePage<isMainFlash>(
               reinterpret_cast<std::uint32_t>(&storage.pages[slot]),
-              reinterpret_cast<std::uint32_t const*>(&r),
-              reinterpret_cast<std::uint32_t const*>(&r + 1));
+              reinterpret_cast<::Kvasir::detail::AliasedWord const*>(&r),
+              reinterpret_cast<::Kvasir::detail::AliasedWord const*>(&r + 1));
 
             newest   = slot;
             sequence = r.payload.sequence;

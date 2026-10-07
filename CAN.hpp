@@ -6,6 +6,7 @@
 #include "core/Nvic.hpp"
 #include "kvasir/Register/Register.hpp"
 #include "kvasir/Util/Prescaler.hpp"
+#include "kvasir/Util/attributes.hpp"
 #include "kvasir/Util/using_literals.hpp"
 #include "peripherals/CAN.hpp"
 #include "uc_log/uc_log.hpp"
@@ -350,9 +351,12 @@ namespace Kvasir { namespace CAN {
         static_assert(MaxFilterSize >= FilterSize,
                       "filter size to big");
 
-        [[gnu::section(".noInitLowRam")]] static inline std::array<CanMessage, RxSize>    RxFIFO{};
-        [[gnu::section(".noInitLowRam")]] static inline std::array<CanMessage, TxSize>    TxFIFO{};
-        [[gnu::section(".noInitLowRam")]] static inline std::array<CanFilter, FilterSize> Filter{};
+        [[KVASIR_SECTION_MEMBER(
+          ".noInitLowRam")]] static inline std::array<CanMessage, RxSize>    RxFIFO{};
+        [[KVASIR_SECTION_MEMBER(
+          ".noInitLowRam")]] static inline std::array<CanMessage, TxSize>    TxFIFO{};
+        [[KVASIR_SECTION_MEMBER(
+          ".noInitLowRam")]] static inline std::array<CanFilter, FilterSize> Filter{};
 
         static void runtimeInit() {
             std::uint32_t const rx
