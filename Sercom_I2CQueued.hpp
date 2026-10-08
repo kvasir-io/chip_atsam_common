@@ -30,7 +30,7 @@ namespace Kvasir { namespace Sercom { namespace I2C {
     /// use them.
     ///
     /// Sercom_I2C.hpp keeps the SERCOM's register configuration (Detail::I2CBase) this is
-    /// built on; the older non-queued `I2CBehavior` that lived there went on 2026-09-13
+    /// built on; the older non-queued `I2CBehavior` that lived there went
     /// with the last driver written against its acquire/operationState style. What this
     /// one guarantees the engine:
     ///
@@ -43,8 +43,8 @@ namespace Kvasir { namespace Sercom { namespace I2C {
     ///
     /// One transfer is on the wire at a time, as the peripheral allows.
     ///
-    /// Since 2026-09-20 it also looks after the bus the way the RP driver does, with the same
-    /// calls (i2c_testing judges a bus by them on either chip):
+    /// It also looks after the bus the way the RP driver does, with the same
+    /// calls (a bus is judged by them on either chip):
     ///
     ///  * a transfer gets calcTransferTimeout() for its length, not a flat 100 ms, and one that
     ///    runs out is ended by a software reset of the block - the data sheet's own way out of

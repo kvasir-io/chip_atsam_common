@@ -37,7 +37,7 @@
 //     UsbMaxReceive    512: the same for a bulk OUT endpoint, which the module fills by itself
 //                      (32.6.2.8); 64 turns it off.
 //
-// On hardware since 2026-09-20 (ATSAMD21G18A, usb_playground's suites).
+// Run on hardware (ATSAMD21G18A).
 
 #include "../Clocks.hpp"
 #include "chip/Usb_Traits.hpp"
@@ -338,7 +338,7 @@ public:
         // otherwise excess data may be written to SRAM locations used by other parts of the
         // application" - and BYTE_COUNT, the module's count of what came, starts at zero. ADDR's
         // two low bits must be zero (32.15.1). What the data sheet leaves open was asked of the
-        // silicon (2026-09-20): full packets are acknowledged and only add to BYTE_COUNT, without
+        // silicon: full packets are acknowledged and only add to BYTE_COUNT, without
         // TRCPT0; a short packet ends the transfer with one; and behind a short packet's payload
         // the module writes its CRC, up to two bytes, still inside that packet's 64 (32.6.2.7).
         static constexpr std::size_t MaxReceive
@@ -515,7 +515,7 @@ public:
             apply(write(Regs::INTENCLR::FULLREGISTER, Regs::INTENCLR::wakeup.Mask));
             // SUSPEND goes with it. Figure 32-8 says the module clears it on wakeup, the register
             // description says "this flag is cleared by writing a one to the flag" - and on the
-            // SAM D21 it was still set here (2026-09-20): enabling its interrupt again fired it
+            // SAM D21 it was still set here: enabling its interrupt again fired it
             // at once, that enabled WAKEUP, the next token on the bus set that, and so on - two
             // interrupts per frame on an idle bus, 36 000 to 119 000 a second under traffic,
             // a third to nine tenths of the core. Found by counting the interrupt's entries.
