@@ -1,5 +1,6 @@
 #pragma once
 #include "DMAC.hpp"
+#include "WaitBounds.hpp"
 //#include "chip/MCLK.hpp"
 #include "chip/PM.hpp"
 #include "chip/Sercom_Traits.hpp"
@@ -363,6 +364,14 @@ namespace Kvasir { namespace Sercom { namespace Usart {
           set(Regs::CTRLA::enable),
           typename Config::template GetRxPinConfig<std::decay_t<
             decltype(UsartConfig::rxPinLocation)>>::template interruptEnable<InterruptIndexs>{});
+
+        // CTRLA.ENABLE is write-synchronized and SYNCBUSY.ENABLE clears when the enable is done (D21 DS40001882L
+        // 26.6.6, 14.3.2.5); what a DATA write during that time does is not stated, so nothing is sent before
+        // it. As Sercom_SPIQueued does.
+        static void runtimeInit() {
+            Kvasir::Register::waitUntil<Kvasir::Chip::Sam::SyncBound>(
+              Kvasir::Register::isClear(Regs::SYNCBUSY::enable));
+        }
     };
 
     template<typename UartConfig,

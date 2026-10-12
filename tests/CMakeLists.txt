@@ -1,7 +1,8 @@
 cmake_minimum_required(VERSION 3.28)
 
-# Host tests of the SAM clock solver (ClockSolver.hpp) against the test limits in TestLimits.hpp. Standalone, needs only
-# Kvasir_SDK's Util/Prescaler.hpp (KVASIR_ROOT, default: the checkout next to this one):
+# Host tests of the SAM clock solver (ClockSolver.hpp) against the test limits in TestLimits.hpp, and of the NVM
+# controller's error decoding (NvmResult.hpp). Standalone, needs only Kvasir_SDK's Util/Prescaler.hpp (KVASIR_ROOT,
+# default: the checkout next to this one):
 #
 # cmake -S tests -B tests/build -G Ninja && cmake --build tests/build && ctest --test-dir tests/build
 #
@@ -24,6 +25,11 @@ add_executable(clock_solver clock_solver_test.cpp)
 target_include_directories(clock_solver PRIVATE ${KVASIR_ROOT}/src)
 target_compile_options(clock_solver PRIVATE -Wall -Wextra -Wpedantic -Werror)
 add_test(NAME clock_solver COMMAND clock_solver)
+
+# NvmResult.hpp: the NVM controller's error flags as Nvm::Error, needs nothing but the standard library
+add_executable(nvm_result nvm_result_test.cpp)
+target_compile_options(nvm_result PRIVATE -Wall -Wextra -Wpedantic -Werror)
+add_test(NAME nvm_result COMMAND nvm_result)
 
 set(_must_fail_messages
     "flash wait states: 48000000 Hz at 1.62-2.7 V needs 3 \\(test table\\), RWS is 1"

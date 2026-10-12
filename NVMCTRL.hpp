@@ -1,38 +1,158 @@
 #pragma once
-
+// The SAM NVM controller's row erase and page write, and the stores built on them (SimpleEeprom, EepromEmulator,
+// FlashJournal, Flash::NvmRegion for CellStore).
+//
+// Every command waits for READY (a datasheet bound, never issued while busy: "Any commands written while
+// INTFLAG.READY is low will be ignored", D21 DS40001882L 22.6.4), clears the error flags, runs, waits again and
+// returns an Nvm::Result: lock (LOCKE - a locked region or the BOOTPROT section: "the erase will not be performed",
+// 22.6.4.5), program (PROGE - bad key, invalid command, busy: 22.8.1), nvm (NVME), timeout. Every page write is read
+// back word by word (verify). A store that fails keeps its value pending and writes it by itself later, with a
+// pause that doubles up to 10 min (Kvasir::Retry), as soon as it is listed in the Startup list (its Hook::MainLoop
+// function maintain() does the retry): `pending()`, `retry()` say how it stands.
 #include "chip/NVMCTRL_Traits.hpp"
 #include "chip/atsam_common/DMAC.hpp"
+#include "chip/atsam_common/NvmResult.hpp"
 #include "kvasir/Register/Register.hpp"
 #include "kvasir/Register/Utility.hpp"
+#include "kvasir/Register/Wait.hpp"
+#include "kvasir/StartUp/Hooks.hpp"
+#include "kvasir/Util/Retry.hpp"
 #include "kvasir/Util/attributes.hpp"
 #include "peripherals/NVMCTRL.hpp"
 
+#include <array>
 #include <cassert>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <optional>
+#include <span>
+
+#ifdef USE_UC_LOG
+    #include "uc_log/uc_log.hpp"
+#endif
 
 namespace Kvasir {
+namespace Nvm {
+    /// A store's pending write: Kvasir::Retry with the NVM error.
+    template<typename Clock>
+    using Retry = Kvasir::Retry<Clock, Error>;
+
+    namespace Detail {
+        /// Error flags found set BEFORE a command (left by an earlier one, or by code that does not go through here):
+        /// counted, not blamed on the next command. `kvasir_bench.py peek` reads it.
+        inline constinit std::uint32_t volatile staleFlags{};
+
+        template<typename Bound>
+        [[nodiscard]] inline bool waitReady() {
+            return static_cast<bool>(
+              Kvasir::Register::waitUntil<Bound, Kvasir::Register::OnTimeout::Report>(
+                [] { return NVMCTRL::Traits::ready(); }));
+        }
+
+        /// One command: ready, flags cleared, `issue()` (writes ADDR and CTRLA), ready, the flags it raised.
+        template<typename Bound,
+                 typename Issue>
+        [[nodiscard]] Result<> command(Issue issue) {
+            if(!waitReady<Bound>()) { return std::unexpected{Error::timeout}; }
+            if(NVMCTRL::Traits::takeErrors() != 0) { staleFlags = staleFlags + 1; }
+            issue();
+            if(!waitReady<Bound>()) { return std::unexpected{Error::timeout}; }
+            return fromBits(NVMCTRL::Traits::takeErrors());
+        }
+
+        /// The address range of a command inside its array (D21, C21: the controller wraps an address past the end
+        /// and erases a row of the image instead; E5x reports ADDRE itself). A range outside is refused before the
+        /// controller sees it, as a program error (what E5x's ADDRE is too).
+        template<bool isMainFlash>
+        [[nodiscard]] inline bool inArray(std::uint32_t address,
+                                          std::uint32_t bytes) {
+            return NVMCTRL::Traits::inArray(address, bytes, isMainFlash);
+        }
+
+        /// The cache is off while a command runs (D21 errata 1.11.4; a no-op where the chip needs none).
+        struct CacheOff {
+            CacheOff() { NVMCTRL::Traits::disable_cache(); }
+
+            ~CacheOff() { NVMCTRL::Traits::enable_cache(); }
+
+            CacheOff(CacheOff const&)            = delete;
+            CacheOff& operator=(CacheOff const&) = delete;
+        };
+
+        /// A store's bookkeeping after an attempt: the retry, and one log line when it fails and one when it is back.
+        template<typename Clock>
+        void note(Retry<Clock>&   retry,
+                  Result<> const& r,
+                  std::uintptr_t  where) {
+            if(r) {
+                if(retry.pending) {
+#ifdef USE_UC_LOG
+                    UC_LOG_I("nvm: store at {:#x} written after {} failures",
+                             where,
+                             retry.failures);
+#endif
+                }
+                retry.succeeded();
+                return;
+            }
+            auto const now = Clock::now();
+            retry.failed(r.error(), now);
+#ifdef USE_UC_LOG
+            UC_LOG_E("nvm: store at {:#x} failed: {} (failure {}, retry in {})",
+                     where,
+                     r.error(),
+                     retry.failures,
+                     std::chrono::duration_cast<std::chrono::milliseconds>(retry.next - now));
+#else
+            static_cast<void>(where);
+#endif
+        }
+    }   // namespace Detail
+}   // namespace Nvm
+
 namespace detail {
     // A 32-bit word that may alias any object: the emulation's flash pages and their images in RAM are read and
     // written word by word, and gcc's -Wstrict-aliasing rejects a plain std::uint32_t lvalue over them.
     using AliasedWord [[gnu::may_alias]] = std::uint32_t;
 
-    template<typename Clock>
-    static constexpr void waitForReady() {
-        auto const timeout = Clock::now() + 100ms;
-        while(!NVMCTRL::Traits::ready()) {
-            if(Clock::now() > timeout) { assert(false); }
-        }
-    }
-
     template<typename Clock,
              bool isMainFlash>
-    static constexpr void clearRow(std::uint32_t address) {
-        NVMCTRL::Traits::set_addr(address);
-        if constexpr(isMainFlash) {
-            NVMCTRL::Traits::command_erase_row();
-        } else {
-            NVMCTRL::Traits::command_erase_rww();
+    [[nodiscard]] Nvm::Result<> clearRow(std::uint32_t address) {
+        if(!Nvm::Detail::inArray<isMainFlash>(address,
+                                              NVMCTRL::Traits::PageSize
+                                                * NVMCTRL::Traits::PagesPerRow))
+        {
+            return std::unexpected{Nvm::Error::program};
         }
-        waitForReady<Clock>();
+        Nvm::Detail::CacheOff const cacheOff{};
+        return Nvm::Detail::command<NVMCTRL::Traits::EraseBound>([address] {
+            NVMCTRL::Traits::set_addr(address);
+            if constexpr(isMainFlash) {
+                NVMCTRL::Traits::command_erase_row();
+            } else {
+                NVMCTRL::Traits::prepare_erase_rww(address);
+                NVMCTRL::Traits::command_erase_rww();
+            }
+        });
+    }
+
+    /// `n` rows of `rowBytes` from `first`, stopping at the first that fails (one function for every store).
+    template<typename Clock,
+             bool isMainFlash>
+    [[nodiscard]] Nvm::Result<> clearRows(std::uint32_t first,
+                                          std::size_t   n,
+                                          std::size_t   rowBytes) {
+        for(std::size_t i{}; i != n; ++i) {
+            if(auto const r
+               = clearRow<Clock, isMainFlash>(first + static_cast<std::uint32_t>(i * rowBytes));
+               !r)
+            {
+                return r;
+            }
+        }
+        return {};
     }
 
     template<typename Clock, std::size_t pageSize, std::size_t pagesPerRow>
@@ -40,161 +160,99 @@ namespace detail {
         static constexpr std::size_t RowSize  = pageSize * pagesPerRow;
         static constexpr std::size_t PageSize = pageSize;
 
-        template<std::size_t WriteSize, bool isMainFlash>
-        struct Writer {
-            std::uint32_t currentAddress;
-            std::uint32_t remainingSize;
-
-            Writer(std::uint32_t start,
-                   std::uint32_t size)
-              : currentAddress{start}
-              , remainingSize{size} {
-                assert(start % RowSize == 0);
-            }
-
-            template<typename I>
-            void write(I start,
-                       I end) {
-                static_assert(sizeof(decltype(*start)) == 1, "needs to be 1 byte type");
-                std::uint32_t const size{static_cast<std::uint32_t>(std::distance(start, end))};
-
-                assert(reinterpret_cast<std::uint32_t>(&(*start)) % 4 == 0);
-                assert(remainingSize >= size && (size == WriteSize || size == remainingSize));
-
-                if(currentAddress % RowSize == 0) { clearRow<Clock, isMainFlash>(currentAddress); }
-
-                if constexpr(WriteSize == RowSize) {
-                    writeRow<isMainFlash>(
-                      currentAddress,
-                      reinterpret_cast<::Kvasir::detail::AliasedWord const*>(start),
-                      reinterpret_cast<::Kvasir::detail::AliasedWord const*>(end));
-                } else {
-                    writePage<isMainFlash>(
-                      currentAddress,
-                      reinterpret_cast<::Kvasir::detail::AliasedWord const*>(start),
-                      reinterpret_cast<::Kvasir::detail::AliasedWord const*>(end));
-                }
-
-                currentAddress += size;
-                remainingSize -= size;
-            }
-        };
-
+        /// One page: page buffer cleared, filled (words past `end` 0xFFFFFFFF), written, read back.
         template<bool isMainFlash,
                  typename I>
-        static void writePage(std::uint32_t address,
-                              I             start,
-                              I             end) {
+        [[nodiscard]] static Nvm::Result<> writePage(std::uint32_t address,
+                                                     I             start,
+                                                     I             end) {
             static_assert(sizeof(decltype(*start)) == 4, "needs to be 4 byte type");
-            NVMCTRL::Traits::disable_cache();
-            std::size_t const size = static_cast<std::size_t>(std::distance(start, end));
-            assert(PageSize / 4 >= size);
-            NVMCTRL::Traits::set_addr(address);
+            assert(PageSize / 4 >= static_cast<std::size_t>(std::distance(start, end)));
+            if(!Nvm::Detail::inArray<isMainFlash>(address, PageSize)) {
+                return std::unexpected{Nvm::Error::program};
+            }
+            Nvm::Detail::CacheOff const cacheOff{};
+            auto* const                 page = reinterpret_cast<std::uint32_t volatile*>(address);
 
-            NVMCTRL::Traits::command_page_buffer_clear();
-            waitForReady<Clock>();
+            if(auto const r = Nvm::Detail::command<NVMCTRL::Traits::WriteBound>([address] {
+                   NVMCTRL::Traits::set_addr(address);
+                   NVMCTRL::Traits::command_page_buffer_clear();
+               });
+               !r)
+            {
+                return r;
+            }
 
+            auto from = start;
             for(std::size_t i{}; i < PageSize / 4; ++i) {
-                if(start != end) {
-                    *(reinterpret_cast<std::uint32_t volatile*>(address) + i) = *start;
-                    ++start;
+                if(from != end) {
+                    page[i] = *from;
+                    ++from;
                 } else {
-                    *(reinterpret_cast<std::uint32_t volatile*>(address) + i) = 0xffffffff;
+                    page[i] = 0xffffffff;
                 }
             }
 
-            waitForReady<Clock>();
-
-            if constexpr(isMainFlash) {
-                NVMCTRL::Traits::command_write_page();
-            } else {
-                NVMCTRL::Traits::command_write_rww();
+            if(auto const r = Nvm::Detail::command<NVMCTRL::Traits::WriteBound>([] {
+                   if constexpr(isMainFlash) {
+                       NVMCTRL::Traits::command_write_page();
+                   } else {
+                       NVMCTRL::Traits::command_write_rww();
+                   }
+               });
+               !r)
+            {
+                return r;
             }
 
-            waitForReady<Clock>();
-            NVMCTRL::Traits::enable_cache();
+            // the read-back: what STATUS cannot see (a page written without its erase, a worn cell)
+            for(std::size_t i{}; i < PageSize / 4; ++i) {
+                std::uint32_t const want = start != end ? std::uint32_t(*start) : 0xffffffffU;
+                if(start != end) { ++start; }
+                if(page[i] != want) { return std::unexpected{Nvm::Error::verify}; }
+            }
+            return {};
         }
 
         template<bool isMainFlash,
                  typename I>
-        static void writeRow(std::uint32_t address,
-                             I             start,
-                             I             end) {
+        [[nodiscard]] static Nvm::Result<> writeRow(std::uint32_t address,
+                                                    I             start,
+                                                    I             end) {
             static_assert(sizeof(decltype(*start)) == 4, "needs to be 4 byte type");
-            std::size_t const size = static_cast<std::size_t>(std::distance(start, end));
-            assert(RowSize / 4 >= size);
+            assert(RowSize / 4 >= static_cast<std::size_t>(std::distance(start, end)));
 
             for(std::size_t subPage{}; subPage < pagesPerRow; ++subPage) {
-                writePage<isMainFlash>(
-                  address,
-                  start,
-                  std::next(start,
-                            std::min(static_cast<int>(PageSize / 4), std::distance(start, end))));
-                if(std::distance(start, end) < static_cast<int>(PageSize / 4)) { return; }
-                std::advance(start, PageSize / 4);
+                auto const n
+                  = std::min(static_cast<std::ptrdiff_t>(PageSize / 4), std::distance(start, end));
+                if(auto const r = writePage<isMainFlash>(address, start, std::next(start, n)); !r) {
+                    return r;
+                }
+                if(n < static_cast<std::ptrdiff_t>(PageSize / 4)) { return {}; }
+                std::advance(start, n);
                 address += PageSize;
             }
+            return {};
         }
 
         template<bool isMainFlash,
                  typename I>
-        static void clearAndWriteRow(std::uint32_t address,
-                                     I             start,
-                                     I             end) {
-            clearRow<Clock, isMainFlash>(address);
-            writeRow<isMainFlash>(address, start, end);
-        }
-
-        template<typename I>
-        [[KVASIR_RAM_FUNC_ATTRIBUTES]] static void
-        clearAndWriteMultibleRowsRam(std::uint32_t address,
-                                     I             start,
-                                     I             end) {
-            KVASIR_RAM_FUNC_MARK();
-            static_assert(sizeof(decltype(*start)) == 4, "needs to be 4 byte type");
-
-            NVMCTRL::Traits::disable_cache();
-            std::size_t size = static_cast<std::size_t>(end - start) * 4;
-            while(size != 0) {
-                NVMCTRL::Traits::set_addr(address);
-
-                NVMCTRL::Traits::command_erase_row();
-                while(!NVMCTRL::Traits::ready()) {}
-
-                for(std::size_t subPage{}; subPage < pagesPerRow; ++subPage) {
-                    NVMCTRL::Traits::set_addr(address);
-
-                    NVMCTRL::Traits::command_page_buffer_clear();
-                    while(!NVMCTRL::Traits::ready()) {}
-
-                    for(std::size_t i{}; i < PageSize / 4; ++i) {
-                        if(start != end) {
-                            *(reinterpret_cast<std::uint32_t volatile*>(address) + i) = *start;
-                            ++start;
-                        } else {
-                            *(reinterpret_cast<std::uint32_t volatile*>(address) + i) = 0xffffffff;
-                        }
-                    }
-                    while(!NVMCTRL::Traits::ready()) {}
-
-                    NVMCTRL::Traits::command_write_page();
-                    while(!NVMCTRL::Traits::ready()) {}
-                    address += PageSize;
-                }
-                if(size > RowSize) {
-                    size -= RowSize;
-                } else {
-                    size = 0;
-                }
-            }
-            NVMCTRL::Traits::enable_cache();
+        [[nodiscard]] static Nvm::Result<> clearAndWriteRow(std::uint32_t address,
+                                                            I             start,
+                                                            I             end) {
+            if(auto const r = clearRow<Clock, isMainFlash>(address); !r) { return r; }
+            return writeRow<isMainFlash>(address, start, end);
         }
     };
 
 }   // namespace detail
 
-template<typename Clock>
-using Flash = detail::Flash<Clock, NVMCTRL::Traits::PageSize, NVMCTRL::Traits::PagesPerRow>;
+namespace Nvm {
+    /// Row erase and page writes of this chip's NVM. (Not `Kvasir::Flash<Clock>` any more: that name is the namespace
+    /// of CellStore, which a SAM firmware may want next to it.)
+    template<typename Clock>
+    using Flash = detail::Flash<Clock, NVMCTRL::Traits::PageSize, NVMCTRL::Traits::PagesPerRow>;
+}   // namespace Nvm
 
 namespace detail {
 
@@ -227,23 +285,47 @@ namespace detail {
             return ramCopy;
         }
 
-        static void internalWrite() {
+        static Nvm::Result<> internalWrite() {
             ValueStruct newV;
             newV.v   = ramCopy;
             newV.crc = calcCrc(ramCopy);
 
             asm("" : "=m"(newV)::);
 
-            Kvasir::Flash<Clock>::template clearAndWriteRow<isMainFlash>(
+            return Kvasir::Nvm::Flash<Clock>::template clearAndWriteRow<isMainFlash>(
               reinterpret_cast<std::uint32_t>(&flashValue),
               reinterpret_cast<::Kvasir::detail::AliasedWord const*>(&newV),
               reinterpret_cast<::Kvasir::detail::AliasedWord const*>(&newV + 1));
         }
 
-        static void writeValue() {
-            auto const currentFlashValue = readFlashValue();
-            if(ramCopy != currentFlashValue) { internalWrite(); }
+        static Nvm::Result<> attempt() {
+            if(ramCopy == readFlashValue()) { return {}; }
+            if(auto const r = internalWrite(); !r) { return r; }
+            if(ramCopy != readFlashValue()) { return std::unexpected{Nvm::Error::verify}; }
+            return {};
         }
+
+        /// The RAM copy into the flash if it differs; true when the flash holds it. A failure stays pending and is
+        /// written again by maintain(); retry().last says why. (A bool, not the Nvm::Result: libstdc++'s
+        /// std::expected is [[nodiscard]], and a caller may leave the store to it.)
+        static bool writeValue() {
+            auto const r = attempt();
+            Nvm::Detail::note(retry_, r, reinterpret_cast<std::uintptr_t>(&flashValue));
+            return r.has_value();
+        }
+
+        [[nodiscard]] static bool pending() { return retry_.pending; }
+
+        [[nodiscard]] static Nvm::Retry<Clock> const& retry() { return retry_; }
+
+        static void maintain() {
+            if(retry_.due(Clock::now())) { static_cast<void>(writeValue()); }
+        }
+
+        using Extends = brigand::list<Kvasir::Startup::Extend<Kvasir::Hook::MainLoop, &maintain>>;
+
+    private:
+        static inline Nvm::Retry<Clock> retry_{};
     };
 
     template<typename Clock,
@@ -395,13 +477,35 @@ namespace detail {
             return ramCopy;
         }
 
-        static void writeValue() {
-            auto const currentFlashValue = readFlashValue();
-            if(ramCopy != currentFlashValue) { internalWrite(); }
+        static Nvm::Result<> attempt() {
+            if(ramCopy == readFlashValue()) { return {}; }
+            if(auto const r = internalWrite(); !r) { return r; }
+            if(ramCopy != readFlashValue()) { return std::unexpected{Nvm::Error::verify}; }
+            return {};
         }
 
-        static inline T    ramCopy{};
-        static inline bool valueRead{false};
+        /// The RAM copy into the flash if it differs; true when the flash holds it. A failure stays pending and is
+        /// written again by maintain(); retry().last says why. (A bool, not the Nvm::Result: libstdc++'s
+        /// std::expected is [[nodiscard]], and a caller may leave the store to it.)
+        static bool writeValue() {
+            auto const r = attempt();
+            Nvm::Detail::note(retry_, r, reinterpret_cast<std::uintptr_t>(&rows));
+            return r.has_value();
+        }
+
+        [[nodiscard]] static bool pending() { return retry_.pending; }
+
+        [[nodiscard]] static Nvm::Retry<Clock> const& retry() { return retry_; }
+
+        static void maintain() {
+            if(retry_.due(Clock::now())) { static_cast<void>(writeValue()); }
+        }
+
+        using Extends = brigand::list<Kvasir::Startup::Extend<Kvasir::Hook::MainLoop, &maintain>>;
+
+        static inline Nvm::Retry<Clock> retry_{};
+        static inline T                 ramCopy{};
+        static inline bool              valueRead{false};
 
         static bool pageFull(PageStruct const* p) {
             if(!validIndex(p->validBlock)) { return true; }
@@ -430,29 +534,16 @@ namespace detail {
             return ++p;
         }
 
-        static void internalWrite() {
-            auto zeroPage = [&](PageStruct* p) {
-                NVMCTRL::Traits::disable_cache();
-                NVMCTRL::Traits::set_addr(p);
-                NVMCTRL::Traits::command_page_buffer_clear();
-                waitForReady<Clock>();
-
-                for(std::size_t i = 0; i < pageSize / 4; ++i) {
-                    *(reinterpret_cast<::Kvasir::detail::AliasedWord*>(p) + i) = 0;
-                }
-
-                waitForReady<Clock>();
-
-                if constexpr(isMainFlash) {
-                    NVMCTRL::Traits::command_write_page();
-                } else {
-                    NVMCTRL::Traits::command_write_rww();
-                }
-                waitForReady<Clock>();
-                NVMCTRL::Traits::enable_cache();
+        static Nvm::Result<> internalWrite() {
+            using F       = Flash<Clock, pageSize, pagesPerRow>;
+            auto zeroPage = [](PageStruct* p) {
+                std::array<std::uint32_t, pageSize / 4> const zeros{};
+                return F::template writePage<isMainFlash>(reinterpret_cast<std::uint32_t>(p),
+                                                          zeros.data(),
+                                                          zeros.data() + zeros.size());
             };
 
-            auto writeNewV = [&](PageStruct* p, blockType blockV, ValueStruct const& v) {
+            auto writeNewV = [](PageStruct* p, blockType blockV, ValueStruct const& v) {
                 PageStruct newp{*p};
 
                 newp.validBlock              = blockV;
@@ -460,22 +551,16 @@ namespace detail {
 
                 asm("" : "=m"(newp)::);
 
-                NVMCTRL::Traits::set_addr(p);
+                return F::template writePage<isMainFlash>(
+                  reinterpret_cast<std::uint32_t>(p),
+                  reinterpret_cast<::Kvasir::detail::AliasedWord const*>(&newp),
+                  reinterpret_cast<::Kvasir::detail::AliasedWord const*>(&newp + 1));
+            };
 
-                NVMCTRL::Traits::command_page_buffer_clear();
-                waitForReady<Clock>();
-
-                for(std::size_t i = 0; i < pageSize / 4; ++i) {
-                    *(reinterpret_cast<::Kvasir::detail::AliasedWord*>(p) + i)
-                      = *(reinterpret_cast<::Kvasir::detail::AliasedWord const*>(&newp) + i);
-                }
-
-                if constexpr(isMainFlash) {
-                    NVMCTRL::Traits::command_write_page();
-                } else {
-                    NVMCTRL::Traits::command_write_rww();
-                }
-                waitForReady<Clock>();
+            auto clearAll = [] {
+                return clearRows<Clock, isMainFlash>(reinterpret_cast<std::uint32_t>(rows.data()),
+                                                     rows.size(),
+                                                     sizeof(RowStruct));
             };
 
             auto const newV{calcVS(ramCopy)};
@@ -487,17 +572,13 @@ namespace detail {
             RowStruct*  rowToClear{nullptr};
 
             if(vp.nPages != 1 || vp.page == nullptr) {
-                for(auto& row : rows) {
-                    clearRow<Clock, isMainFlash>(reinterpret_cast<std::uint32_t>(&row));
-                }
+                if(auto const r = clearAll(); !r) { return r; }
                 pageToWrite = &(*rows.front().pages.begin());
             } else {
                 if(pageFull(vp.page)) {
                     pageToWrite = nextPage(vp.page);
                     if(!pageCleared(pageToWrite)) {
-                        for(auto& row : rows) {
-                            clearRow<Clock, isMainFlash>(reinterpret_cast<std::uint32_t>(&row));
-                        }
+                        if(auto const r = clearAll(); !r) { return r; }
                         pageToWrite = &(*rows.front().pages.begin());
                     } else {
                         if(pageToWrite == &rows[0].pages[0]) {
@@ -513,13 +594,23 @@ namespace detail {
                 }
             }
 
-            writeNewV(pageToWrite, nextBlockValue(pageToWrite->validBlock), newV);
-
-            if(rowToClear != nullptr) {
-                clearRow<Clock, isMainFlash>(reinterpret_cast<std::uint32_t>(rowToClear));
+            if(auto const r = writeNewV(pageToWrite, nextBlockValue(pageToWrite->validBlock), newV);
+               !r)
+            {
+                return r;
             }
 
-            if(pageToZero != nullptr) { zeroPage(pageToZero); }
+            if(rowToClear != nullptr) {
+                if(auto const r
+                   = clearRow<Clock, isMainFlash>(reinterpret_cast<std::uint32_t>(rowToClear));
+                   !r)
+                {
+                    return r;
+                }
+            }
+
+            if(pageToZero != nullptr) { return zeroPage(pageToZero); }
+            return {};
         }
     };
 
@@ -609,8 +700,31 @@ namespace detail {
         }
 
         /// Blocks for a page write (2.5 ms max.), every pagesPerRow-th time for a row erase
-        /// as well (6 ms max.; data sheet table 37-45, tFPP and tFRE).
-        static void write(T const& v) {
+        /// as well (6 ms max.; data sheet table 37-45, tFPP and tFRE). A failure keeps `v` pending: maintain()
+        /// writes it later unless a newer write() came first.
+        /// True when the flash holds `v`; retry().last says why not (a bool: see EepromEmulator::writeValue).
+        static bool write(T const& v) {
+            auto const r = attempt(v);
+            if(!r) { pendingValue_ = v; }
+            Nvm::Detail::note(retry_, r, reinterpret_cast<std::uintptr_t>(&storage));
+            return r.has_value();
+        }
+
+        [[nodiscard]] static bool pending() { return retry_.pending; }
+
+        [[nodiscard]] static Nvm::Retry<Clock> const& retry() { return retry_; }
+
+        static void maintain() {
+            if(retry_.due(Clock::now())) { static_cast<void>(write(pendingValue_)); }
+        }
+
+        using Extends = brigand::list<Kvasir::Startup::Extend<Kvasir::Hook::MainLoop, &maintain>>;
+
+    private:
+        static inline Nvm::Retry<Clock> retry_{};
+        static inline T                 pendingValue_{};
+
+        static Nvm::Result<> attempt(T const& v) {
             scan();
             std::size_t slot = newest == NumPages ? 0 : (newest + 1) % NumPages;
             // A page that is not blank where one should be (a write cut short): on to the
@@ -619,7 +733,12 @@ namespace detail {
                 slot = (slot / pagesPerRow + 1) * pagesPerRow % NumPages;
             }
             if(slot % pagesPerRow == 0) {
-                clearRow<Clock, isMainFlash>(reinterpret_cast<std::uint32_t>(&storage.pages[slot]));
+                if(auto const r = clearRow<Clock, isMainFlash>(
+                     reinterpret_cast<std::uint32_t>(&storage.pages[slot]));
+                   !r)
+                {
+                    return r;
+                }
             }
 
             Record r{};
@@ -629,13 +748,19 @@ namespace detail {
 
             asm("" : "=m"(r)::);
 
-            Flash<Clock, pageSize, pagesPerRow>::template writePage<isMainFlash>(
-              reinterpret_cast<std::uint32_t>(&storage.pages[slot]),
-              reinterpret_cast<::Kvasir::detail::AliasedWord const*>(&r),
-              reinterpret_cast<::Kvasir::detail::AliasedWord const*>(&r + 1));
-
-            newest   = slot;
+            // the sequence is used up either way: a failed page may hold it, and is never written over
             sequence = r.payload.sequence;
+            if(auto const w = Flash<Clock, pageSize, pagesPerRow>::template writePage<isMainFlash>(
+                 reinterpret_cast<std::uint32_t>(&storage.pages[slot]),
+                 reinterpret_cast<::Kvasir::detail::AliasedWord const*>(&r),
+                 reinterpret_cast<::Kvasir::detail::AliasedWord const*>(&r + 1));
+               !w)
+            {
+                return w;
+            }
+
+            newest = slot;
+            return {};
         }
     };
 }   // namespace detail
@@ -661,5 +786,62 @@ using SimpleEeprom = detail::SimpleEeprom<Clock,
                                           ValueType,
                                           NVMCTRL::Traits::PageSize * NVMCTRL::Traits::PagesPerRow,
                                           isMainFlash>;
+
+namespace Nvm {
+    /// A SAM flash range as a Kvasir::Flash::NorRegion (kvasir/Util/CellStore.hpp): `Rows` rows from the absolute
+    /// address `Base` (a row boundary), in the main array or (isMainFlash = false) in the RWWEE array. A sector is a
+    /// row (the erase unit), a page a page. The range is the firmware's to choose: it must not overlap the image or
+    /// a .eeprom store, nothing checks that. A program or erase that the controller refuses (Nvm::Error) is a false
+    /// to CellStore, which reports CellError::flash; CellEeprom then keeps the value pending and retries.
+    ///
+    ///     using Region   = Kvasir::Nvm::Region<Clock, 0x3'F000, 4, true>;            // the last 4 rows of 256 KB
+    ///     using Settings = Kvasir::Flash::CellEeprom<Kvasir::Flash::CellStore<Region, Cfg>, Clock>;
+    template<typename Clock, std::uint32_t Base, std::uint32_t Rows, bool isMainFlash>
+    struct Region {
+        using F = Flash<Clock>;
+        static_assert(Base % F::RowSize == 0,
+                      "a region starts on a row");
+        static_assert(Rows >= 2,
+                      "CellStore needs two erase units at least");
+
+        static constexpr std::uint32_t SectorBytes = F::RowSize;
+        static constexpr std::uint32_t PageBytes   = F::PageSize;
+
+        static constexpr std::uint32_t sectorCount() { return Rows; }
+
+        static bool read(std::uint32_t        addr,
+                         std::span<std::byte> out) {
+            if(std::uint64_t{addr} + out.size() > std::uint64_t{Rows} * SectorBytes) {
+                return false;
+            }
+            std::memcpy(out.data(), reinterpret_cast<void const*>(Base + addr), out.size());
+            return true;
+        }
+
+        /// Bytes inside one page; the rest of the page is written as 0xFF (programs nothing).
+        static bool program(std::uint32_t              addr,
+                            std::span<std::byte const> in) {
+            if(in.empty() || std::uint64_t{addr} + in.size() > std::uint64_t{Rows} * SectorBytes
+               || addr / PageBytes != (addr + in.size() - 1) / PageBytes)
+            {
+                return false;
+            }
+            std::array<std::uint32_t, PageBytes / 4> words{};
+            words.fill(0xFFFF'FFFFU);
+            std::memcpy(reinterpret_cast<std::byte*>(words.data()) + addr % PageBytes,
+                        in.data(),
+                        in.size());
+            return F::template writePage<isMainFlash>(Base + addr / PageBytes * PageBytes,
+                                                      words.begin(),
+                                                      words.end())
+              .has_value();
+        }
+
+        static bool erase(std::uint32_t sector) {
+            if(sector >= Rows) { return false; }
+            return detail::clearRow<Clock, isMainFlash>(Base + sector * SectorBytes).has_value();
+        }
+    };
+}   // namespace Nvm
 
 }   // namespace Kvasir

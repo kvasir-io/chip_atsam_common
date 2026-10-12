@@ -1,13 +1,15 @@
 #pragma once
 
 #include "chip/Fuse_Traits.hpp"
+#include "chip/atsam_common/NVMCTRL.hpp"
 #include "kvasir/Util/BitField.hpp"
 #include "kvasir/Util/using_literals.hpp"
 #include "peripherals/NVMCTRL.hpp"
 #include "uc_log/uc_log.hpp"
 
-#include <cassert>
+#include <array>
 #include <cstdint>
+#include <cstring>
 
 namespace Kvasir { namespace Fuses {
 
@@ -129,66 +131,90 @@ namespace Kvasir { namespace Fuses {
         }
     };
 
+    enum class FuseWrite : std::uint8_t {
+        upToDate,         ///< the user row already held them
+        written,          ///< written; they take effect after the next reset (DS40001882L 22.6.3)
+        securityBitSet,   ///< not written: the security bit is set (only a chip erase clears it)
+    };
+
+    /// Writes the user row's fuse fields where they differ from `soll` (the other bits kept) and, with `lock`, sets
+    /// the security bit. Every NVM command is checked (Nvm::Detail::command in NVMCTRL.hpp: EAR, PBC, WAP, SSB, each after READY),
+    /// and the two words are read back after WAP (Error::verify). Callers run it at every boot, so a failed
+    /// write is tried again at the next one.
     template<typename Clock>
-    void setFuseBits(FuseBits const& soll,
-                     bool            lock = false) {
-        using NVME = Kvasir::Peripheral::NVMCTRL::Registers<>;
+    [[nodiscard]] ::Kvasir::Nvm::Result<FuseWrite> setFuseBits(FuseBits const& soll,
+                                                               bool            lock = false) {
+        using NVME   = Kvasir::Peripheral::NVMCTRL::Registers<>;
+        using Erase  = NVMCTRL::Traits::EraseBound;
+        using Write  = NVMCTRL::Traits::WriteBound;
+        using Result = ::Kvasir::Nvm::Result<FuseWrite>;
 
         static constexpr std::uint32_t fuseBitAddr = 0x00804000;
-        std::array<std::byte, 8> const oldFuseBits = []() {
-            std::array<std::uint32_t, 2> const bits{
-              *reinterpret_cast<std::uint32_t volatile*>(fuseBitAddr),
-              *reinterpret_cast<std::uint32_t volatile*>(fuseBitAddr + 4)};
-            std::array<std::byte, 8> buff{};
+        auto* const                    row = reinterpret_cast<std::uint32_t volatile*>(fuseBitAddr);
+        std::array<std::byte, 8> const oldFuseBits = [row]() {
+            std::array<std::uint32_t, 2> const bits{row[0], row[1]};
+            std::array<std::byte, 8>           buff{};
             std::memcpy(buff.data(), bits.data(), buff.size());
             return buff;
         }();
 
-        bool needToWrite = false;
-        if(!FuseBits::isValid(oldFuseBits) || soll != FuseBits{oldFuseBits}) { needToWrite = true; }
-
-        if(needToWrite) {
-            bool securityBit = apply(read(NVME::STATUS::sb));
-            if(!securityBit) {
-                std::array<std::byte, 8> newFuseBits = oldFuseBits;
-                soll.combineInto(newFuseBits);
-
-                std::array<std::uint32_t, 2> bits{};
-                std::memcpy(bits.data(), newFuseBits.data(), newFuseBits.size());
-
-                auto waitForReady = []() {
-                    auto const timeout = Clock::now() + 100ms;
-                    while(!apply(read(NVME::INTFLAG::ready))) {
-                        if(Clock::now() > timeout) { assert(false); }
-                    }
-                };
-
-                apply(set(NVME::CTRLB::cachedis));
-                apply(write(NVME::ADDR::addr,
-                            Kvasir::Register::value<(fuseBitAddr / 2)
-                                                    & Kvasir::Register::maskFromRange(21, 0)>()));
-
-                apply(write(NVME::CTRLA::CMDValC::ear), write(NVME::CTRLA::CMDEXValC::key));
-                waitForReady();
-                apply(write(NVME::CTRLA::CMDValC::pbc), write(NVME::CTRLA::CMDEXValC::key));
-                waitForReady();
-                *reinterpret_cast<std::uint32_t volatile*>(fuseBitAddr)     = bits[0];
-                *reinterpret_cast<std::uint32_t volatile*>(fuseBitAddr + 4) = bits[1];
-                apply(write(NVME::CTRLA::CMDValC::wap), write(NVME::CTRLA::CMDEXValC::key));
-                apply(clear(NVME::CTRLB::cachedis));
-
-                if(lock) {
-                    apply(write(NVME::CTRLA::CMDValC::ssb), write(NVME::CTRLA::CMDEXValC::key));
-                }
-
-                UC_LOG_D("fuse bits written need power cycle to get active");
-
-            } else {
-                UC_LOG_E("want to write fuse bits but securityBit set");
-            }
-        } else {
+        if(FuseBits::isValid(oldFuseBits) && soll == FuseBits{oldFuseBits}) {
             UC_LOG_D("fuse bits already up to date");
+            return FuseWrite::upToDate;
         }
+        if(apply(read(NVME::STATUS::sb))) {
+            UC_LOG_E("want to write fuse bits but securityBit set");
+            return FuseWrite::securityBitSet;
+        }
+
+        std::array<std::byte, 8> newFuseBits = oldFuseBits;
+        soll.combineInto(newFuseBits);
+        std::array<std::uint32_t, 2> bits{};
+        std::memcpy(bits.data(), newFuseBits.data(), newFuseBits.size());
+
+        ::Kvasir::Nvm::Detail::CacheOff const cacheOff{};
+        auto const                            cmd
+          = [](auto value) { apply(write(value), write(NVME::CTRLA::CMDEXValC::key)); };
+        if(auto const r = ::Kvasir::Nvm::Detail::command<Erase>([&] {
+               NVMCTRL::Traits::set_addr(fuseBitAddr);
+               cmd(NVME::CTRLA::CMDValC::ear);
+           });
+           !r)
+        {
+            return Result{std::unexpect, r.error()};
+        }
+        if(auto const r
+           = ::Kvasir::Nvm::Detail::command<Write>([&] { cmd(NVME::CTRLA::CMDValC::pbc); });
+           !r)
+        {
+            return Result{std::unexpect, r.error()};
+        }
+        row[0] = bits[0];
+        row[1] = bits[1];
+        if(auto const r = ::Kvasir::Nvm::Detail::command<Write>([&] {
+               NVMCTRL::Traits::set_addr(fuseBitAddr);
+               cmd(NVME::CTRLA::CMDValC::wap);
+           });
+           !r)
+        {
+            return Result{std::unexpect, r.error()};
+        }
+        if(row[0] != bits[0] || row[1] != bits[1]) {
+            return Result{std::unexpect, ::Kvasir::Nvm::Error::verify};
+        }
+
+        // "After issuing the SSB command, the PROGE error bit can be checked" (22.6.6)
+        if(lock) {
+            if(auto const r
+               = ::Kvasir::Nvm::Detail::command<Write>([&] { cmd(NVME::CTRLA::CMDValC::ssb); });
+               !r)
+            {
+                return Result{std::unexpect, r.error()};
+            }
+        }
+
+        UC_LOG_D("fuse bits written, they take effect after the next reset");
+        return FuseWrite::written;
     }
 
 }}   // namespace Kvasir::Fuses
