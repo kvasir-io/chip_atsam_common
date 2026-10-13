@@ -49,7 +49,8 @@ namespace Kvasir { namespace Startup { namespace Sam {
         if(restarted || vectors != 0U || Kvasir::GCLK::looksLikeAfterReset()) { return; }
         restartMark = RestartRequested;
         asm volatile("dsb" ::: "memory");
-        *reinterpret_cast<std::uint32_t volatile*>(0xE000'ED0CU) = 0x05FA'0004U;
+        apply(Kvasir::SystemControl::
+                SystemReset{});   // AIRCR = VECTKEY | SYSRESETREQ, the rest at its defaults
         asm volatile("dsb" ::: "memory");
         while(true) {}
     }

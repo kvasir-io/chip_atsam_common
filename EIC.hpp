@@ -188,8 +188,7 @@ namespace Kvasir { namespace EIC {
         static void preEnableRuntimeInit() {
             apply(Regs::CTRLA::overrideDefaults(set(Regs::CTRLA::enable)));
             waitForSync<Regs>();
-            using Flags = typename decltype(Regs::INTFLAG::FULLREGISTER)::DataType;
-            apply(write(Regs::INTFLAG::FULLREGISTER, static_cast<Flags>(~Flags{})));
+            apply(reset(Regs::INTFLAG::extint));
             clearPending(std::make_index_sequence<16>{});
         }
 

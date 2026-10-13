@@ -276,22 +276,26 @@ namespace DMAC {
                  typename Regs_t = Regs>
         static ChannelEvent takeEvent() {
             static_assert(numberOfChannels > static_cast<std::size_t>(Channel));
-            std::uint8_t flags{};
             if constexpr(Traits::DmacTraits::OldImpl) {
                 apply(write(
                   Regs_t::CHID::id,
                   Kvasir::Register::value<std::uint8_t, static_cast<std::uint8_t>(Channel)>()));
-                flags = static_cast<std::uint8_t>(
-                  get<0>(apply(read(Regs_t::CHINTFLAG::FULLREGISTER))) & 0x03U);
-                if(flags != 0) { apply(write(Regs_t::CHINTFLAG::FULLREGISTER, flags)); }
+                return takeFlags<typename Regs_t::CHINTFLAG>();
             } else {
                 using CHRegs = typename Regs_t::template CHANNEL<static_cast<std::size_t>(Channel)>;
-                flags        = static_cast<std::uint8_t>(
-                  get<0>(apply(read(CHRegs::CHINTFLAG::FULLREGISTER))) & 0x03U);
-                if(flags != 0) { apply(write(CHRegs::CHINTFLAG::FULLREGISTER, flags)); }
+                return takeFlags<typename CHRegs::CHINTFLAG>();
             }
-            if((flags & 0x01U) != 0) { return ChannelEvent::error; }
-            if((flags & 0x02U) != 0) { return ChannelEvent::complete; }
+        }
+
+    private:
+        // TERR and TCMPL as read, written back whole: a runtime mask of W1C flags (SUSP stays)
+        template<typename Flags>
+        [[gnu::always_inline]] static ChannelEvent takeFlags() {
+            auto const flags = static_cast<std::uint8_t>(get<0>(apply(read(Flags::FULLREGISTER)))
+                                                         & (Flags::terr.Mask | Flags::tcmpl.Mask));
+            if(flags != 0) { apply(write(Flags::FULLREGISTER, flags)); }
+            if((flags & Flags::terr.Mask) != 0) { return ChannelEvent::error; }
+            if((flags & Flags::tcmpl.Mask) != 0) { return ChannelEvent::complete; }
             return ChannelEvent::none;
         }
     };

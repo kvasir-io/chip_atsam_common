@@ -604,12 +604,14 @@ namespace Kvasir { namespace Sercom { namespace I2C {
                 ++isrEntries_;
                 lastIsr_ = now;
             }
-            auto const flags  = Kvasir::Register::get<0>(apply(read(Regs::INTFLAG::FULLREGISTER)));
+            auto const flags
+              = apply(read(Regs::INTFLAG::error, Regs::INTFLAG::mb, Regs::INTFLAG::sb));
+            // STATUS whole: it goes into the fault key and the log as it is
             auto const status = Kvasir::Register::get<0>(apply(read(Regs::STATUS::FULLREGISTER)));
-            bool const error  = (flags & ErrorFlag) != 0;
-            bool const mb     = (flags & MbFlag) != 0;
-            bool const sb     = (flags & SbFlag) != 0;
-            bool const rxnack = (status & RxNackBit) != 0;
+            bool const error  = Kvasir::Register::get<0>(flags) != 0;
+            bool const mb     = Kvasir::Register::get<1>(flags) != 0;
+            bool const sb     = Kvasir::Register::get<2>(flags) != 0;
+            bool const rxnack = Kvasir::Register::extract(Regs::STATUS::rxnack, status) != 0;
             if(error) { apply(set(Regs::INTFLAG::error)); }
 
             if(!active_) {
@@ -660,7 +662,9 @@ namespace Kvasir { namespace Sercom { namespace I2C {
                 // A STOP, which also clears MB/SB and lets go of the clock. Without the bus
                 // (arbitration lost) the command does nothing, so the flags are written too.
                 apply(nack_stop);
-                if((status & ArbLostBit) != 0) { apply(set(Regs::INTFLAG::mb, Regs::INTFLAG::sb)); }
+                if(Kvasir::Register::extract(Regs::STATUS::arblost, status) != 0) {
+                    apply(set(Regs::INTFLAG::mb, Regs::INTFLAG::sb));
+                }
                 complete_(isNak ? Result::notAcknowledged : Result::failed);
                 return;
             }
@@ -717,17 +721,6 @@ namespace Kvasir { namespace Sercom { namespace I2C {
             timeout,
             recovered,
         };
-
-        // INTFLAG and STATUS bit positions (DS40001882, 28.10.6 and 28.10.7).
-        static constexpr std::uint8_t  MbFlag     = 1U << 0U;
-        static constexpr std::uint8_t  SbFlag     = 1U << 1U;
-        static constexpr std::uint8_t  ErrorFlag  = 1U << 7U;
-        static constexpr std::uint16_t ArbLostBit = 1U << 1U;
-        static constexpr std::uint16_t RxNackBit  = 1U << 2U;
-        static_assert(Regs::INTFLAG::mb.Mask == MbFlag && Regs::INTFLAG::sb.Mask == SbFlag
-                      && Regs::INTFLAG::error.Mask == ErrorFlag);
-        static_assert(Regs::STATUS::arblost.Mask == ArbLostBit
-                      && Regs::STATUS::rxnack.Mask == RxNackBit);
 
         static constexpr auto ack_byte_read
           = list(Regs::CTRLB::overrideDefaults(write(Regs::CTRLB::ACKACTValC::send_ack),

@@ -17,7 +17,9 @@
 // The DSU is write-protected at reset on both (D21: PAC1.WPSET reset 0x000002, bit 1 = DSU, md l.2360; C21:
 // PAC.STATUSB reset 0x00000002, bit 1 = DSU, md l.3217); begin() lifts it once - only if set: a second unprotect
 // is an error on both (D21: a CPU exception, md l.2110; C21: INTFLAGA.PAC, 11.5.2.6 md l.2632). C21: WRCTRL with
-// PERID = 32 * bridge + index = 33 (bridge B, index 1; Table 11-2) and KEY CLR.
+// PERID = 32 * bridge + index = 33 (bridge B, index 1; Table 11-2) and KEY CLR. D21: one PAC per bridge, each its
+// own peripheral in the SVD (PAC0..PAC2, one field per protected peripheral, DS40001882L 11.6.2), the DSU on PAC1;
+// WPCLR.DSU is write-one-to-clear, a 0 does nothing (11.6.2.2.1).
 //
 // Synchronous: chunk() waits for DONE (bounded; a chunk that does not finish in TimeoutPolls resets the DSU,
 // CTRL.SWRST - "A running CRC32 operation can be canceled by resetting the module" - and fails: the checker drops
@@ -25,7 +27,11 @@
 #include "kvasir/Util/Crc.hpp"
 #include "kvasir/Util/ImageCheck.hpp"
 #include "peripherals/DSU.hpp"
-#include "peripherals/PAC.hpp"
+#if __has_include("peripherals/PAC1.hpp")   // SAM D21
+    #include "peripherals/PAC1.hpp"
+#else
+    #include "peripherals/PAC.hpp"
+#endif
 
 #include <algorithm>
 #include <cstddef>
@@ -38,7 +44,7 @@ struct SamDsu {
     using Dsu = Kvasir::Peripheral::DSU::Registers<>;
 
     static void begin() {
-        unprotect<SamDsu>();
+        unprotect();
         running_ = 0xFFFF'FFFFU;
     }
 
@@ -51,12 +57,12 @@ struct SamDsu {
         a += head;
         std::uint32_t const words = (end - a) & ~3U;
         if(words != 0) {
-            // STATUSA.DONE (bit 0) and BERR (bit 2) are write-one-to-clear (D21 md l.3574, C21 md l.4429)
-            apply(write(Dsu::STATUSA::FULLREGISTER, (1U << 0U) | (1U << 2U)));
+            // STATUSA.DONE and BERR are write-one-to-clear (D21 md l.3574, C21 md l.4429)
+            apply(reset(Dsu::STATUSA::done, Dsu::STATUSA::berr));
             apply(write(Dsu::ADDR::FULLREGISTER, a));   // AMOD 0: the array
             apply(write(Dsu::LENGTH::FULLREGISTER, words));
             apply(write(Dsu::DATA::FULLREGISTER, running_));
-            apply(write(Dsu::CTRL::FULLREGISTER, 1U << 2U));   // CTRL.CRC
+            apply(set(Dsu::CTRL::crc));
             if(!finished()) { return false; }
             running_ = get<0>(apply(read(Dsu::DATA::FULLREGISTER)));
             a += words;
@@ -72,7 +78,7 @@ private:
         for(std::uint32_t i = 0; i != TimeoutPolls; ++i) {
             if(apply(read(Dsu::STATUSA::done))) { return !apply(read(Dsu::STATUSA::berr)); }
         }
-        apply(write(Dsu::CTRL::FULLREGISTER, 1U << 0U));   // CTRL.SWRST: cancels the CRC32
+        apply(set(Dsu::CTRL::swrst));   // cancels the CRC32
         return false;
     }
 
@@ -86,21 +92,20 @@ private:
         running_ = ~e.finish();
     }
 
-    // the PAC differs: C21/E5x a WRCTRL key register, D21 a WPCLR/WPSET pair per bridge. Dep keeps the other
-    // chip's branch uninstantiated.
-    template<typename Dep>
+    // the PAC differs: C21/E5x a WRCTRL key register, D21 a WPCLR/WPSET pair per bridge, each bridge's PAC its own
+    // peripheral (PAC0..PAC2) - the other chip's names do not exist, hence #if, not if constexpr.
     static void unprotect() {
-        using Pac0 = Kvasir::Peripheral::PAC::Registers<sizeof(Dep) * 0>;
-        if constexpr(requires { Pac0::WRCTRL::perid; }) {
-            if(apply(read(Pac0::STATUSB::dsu_))) {
-                apply(write(Pac0::WRCTRL::FULLREGISTER, (1U << 16U) | 33U));   // KEY CLR, PERID 33
-            }
-        } else {
-            using Pac1 = Kvasir::Peripheral::PAC::Registers<1 + sizeof(Dep) * 0>;
-            if((get<0>(apply(read(Pac1::WPSET::FULLREGISTER))) & (1U << 1U)) != 0) {
-                apply(write(Pac1::WPCLR::FULLREGISTER, 1U << 1U));
-            }
+#if __has_include("peripherals/PAC1.hpp")
+        using Pac1 = Kvasir::Peripheral::PAC1::Registers<>;
+        if(apply(read(Pac1::WPSET::dsu))) { apply(set(Pac1::WPCLR::dsu)); }
+#else
+        using Pac0 = Kvasir::Peripheral::PAC::Registers<>;
+        if(apply(read(Pac0::STATUSB::dsu_))) {
+            // PERID 33: bridge B x 32 + index 1, the DSU
+            apply(write(Pac0::WRCTRL::perid, Kvasir::Register::value<std::uint32_t, 33>()),
+                  write(Pac0::WRCTRL::KEYValC::clr));
         }
+#endif
     }
 
     static inline std::uint32_t running_{0xFFFF'FFFFU};

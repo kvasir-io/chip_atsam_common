@@ -175,39 +175,37 @@ public:
 
         static auto& bank() { return detail::descriptorTable[N].bank[Bank]; }
 
-        // EPSTATUSSET / EPSTATUSCLR are strobes: a '1' sets or clears that bit, a '0' does
-        // nothing, so they are written whole and never read-modify-written.
-        static void statusSet(std::uint8_t mask) {
-            apply(write(E::EPSTATUSSET::FULLREGISTER, mask));
-        }
-
-        static void statusClear(std::uint8_t mask) {
-            apply(write(E::EPSTATUSCLR::FULLREGISTER, mask));
-        }
-
         static inline std::size_t sentOfCancelled_{};
 
-        static constexpr std::uint8_t ReadyMask
-          = IsIn ? E::EPSTATUSSET::bk1rdy.Mask : E::EPSTATUSSET::bk0rdy.Mask;
-        static constexpr std::uint8_t ToggleMask
-          = IsIn ? E::EPSTATUSSET::dtglin.Mask : E::EPSTATUSSET::dtglout.Mask;
-        static constexpr std::uint8_t StallMask
-          = IsIn ? E::EPSTATUSSET::stallrq1.Mask : E::EPSTATUSSET::stallrq0.Mask;
-        static constexpr std::uint8_t CompleteMask
-          = IsIn ? E::EPINTFLAG::trcpt1.Mask : E::EPINTFLAG::trcpt0.Mask;
+        // This direction's bits: bank 1 / DTGLIN / STALLRQ1 / TRCPT1 for IN, bank 0 / DTGLOUT /
+        // STALLRQ0 / TRCPT0 for OUT. EPSTATUSSET / EPSTATUSCLR are strobes (a '1' sets or clears
+        // that bit, a '0' does nothing): write-only registers, so a set() of them is one store.
+        template<typename InField, typename OutField>
+        using PerDir = std::remove_cvref_t<std::conditional_t<IsIn, InField, OutField>>;
+
+        using Ready    = PerDir<decltype(E::EPSTATUS::bk1rdy), decltype(E::EPSTATUS::bk0rdy)>;
+        using ReadySet = PerDir<decltype(E::EPSTATUSSET::bk1rdy), decltype(E::EPSTATUSSET::bk0rdy)>;
+        using ReadyClear
+          = PerDir<decltype(E::EPSTATUSCLR::bk1rdy), decltype(E::EPSTATUSCLR::bk0rdy)>;
+        using ToggleClear
+          = PerDir<decltype(E::EPSTATUSCLR::dtglin), decltype(E::EPSTATUSCLR::dtglout)>;
+        using StallSet
+          = PerDir<decltype(E::EPSTATUSSET::stallrq1), decltype(E::EPSTATUSSET::stallrq0)>;
+        using StallClear
+          = PerDir<decltype(E::EPSTATUSCLR::stallrq1), decltype(E::EPSTATUSCLR::stallrq0)>;
+        using Complete = PerDir<decltype(E::EPINTFLAG::trcpt1), decltype(E::EPINTFLAG::trcpt0)>;
+        using CompleteEnable
+          = PerDir<decltype(E::EPINTENSET::trcpt1), decltype(E::EPINTENSET::trcpt0)>;
 
         // Bank 1 ready: a packet waits to be sent. Bank 0 ready: a packet was received, or
         // nothing is wanted - the module NAKs an OUT while it is set (32.6.2.7, 32.6.2.9). So an
         // IN endpoint is with the controller while BK1RDY is set, an OUT one while BK0RDY is clear.
         static bool withController() {
-            std::uint8_t const status = apply(read(E::EPSTATUS::FULLREGISTER));
-            return IsIn ? (status & ReadyMask) != 0 : (status & ReadyMask) == 0;
+            bool const ready = apply(read(Ready{})) != 0;
+            return IsIn ? ready : !ready;
         }
 
-        static bool completionPending() {
-            std::uint8_t const flags = apply(read(E::EPINTFLAG::FULLREGISTER));
-            return (flags & CompleteMask) != 0;
-        }
+        static bool completionPending() { return apply(read(Complete{})) != 0; }
 
         // EPCFG.EPTYPEn (32.12.1): 1 control, 2 isochronous, 3 bulk, 4 interrupt - one more than
         // the transfer type's code in a descriptor.
@@ -228,21 +226,20 @@ public:
 
             // nothing to send, nothing wanted, DATA0 next, not stalled
             if constexpr(IsIn) {
-                statusClear(ReadyMask | ToggleMask | StallMask);
+                apply(set(ReadyClear{}, ToggleClear{}, StallClear{}));
                 apply(write(E::EPCFG::eptype1, EpType));
             } else {
-                statusSet(ReadyMask);
-                statusClear(ToggleMask | StallMask);
+                apply(set(ReadySet{}));
+                apply(set(ToggleClear{}, StallClear{}));
                 apply(write(E::EPCFG::eptype0, EpType));
             }
             // The flag is a strobe too (write '1' to clear); then the interrupt. Transfer
             // failures (every NAK is one) and sent STALLs stay off.
-            apply(write(E::EPINTFLAG::FULLREGISTER, CompleteMask));
+            apply(Kvasir::Register::reset(Complete{}));
             if constexpr(Type == EndpointTransferType::Control && !IsIn) {
-                apply(write(E::EPINTENSET::FULLREGISTER,
-                            static_cast<std::uint8_t>(CompleteMask | E::EPINTENSET::rxstp.Mask)));
+                apply(set(CompleteEnable{}, E::EPINTENSET::rxstp));
             } else {
-                apply(write(E::EPINTENSET::FULLREGISTER, CompleteMask));
+                apply(set(CompleteEnable{}));
             }
         }
 
@@ -283,7 +280,7 @@ public:
             std::copy(data.begin(), data.end(), buffer.begin());
             bank().addr    = reinterpret_cast<std::uint32_t>(buffer.data());
             bank().pcksize = detail::Size64 | static_cast<std::uint32_t>(data.size());
-            statusSet(ReadyMask);
+            apply(set(ReadySet{}));
             return true;
         }
 
@@ -308,7 +305,7 @@ public:
             }
             bank().addr    = reinterpret_cast<std::uint32_t>(data.data());
             bank().pcksize = detail::Size64 | static_cast<std::uint32_t>(data.size());
-            statusSet(ReadyMask);
+            apply(set(ReadySet{}));
             return true;
         }
 
@@ -329,7 +326,7 @@ public:
             bank().addr    = reinterpret_cast<std::uint32_t>(buffer.data());
             bank().pcksize = detail::Size64
                            | (static_cast<std::uint32_t>(MaxPacketSize) << detail::MultiPacketPos);
-            statusClear(ReadyMask);
+            apply(set(ReadyClear{}));
             return true;
         }
 
@@ -356,7 +353,7 @@ public:
             bank().addr    = reinterpret_cast<std::uint32_t>(dest.data());
             bank().pcksize = detail::Size64
                            | (static_cast<std::uint32_t>(dest.size()) << detail::MultiPacketPos);
-            statusClear(ReadyMask);
+            apply(set(ReadyClear{}));
             return true;
         }
 
@@ -383,7 +380,7 @@ public:
             requires(!IsIn && Type == EndpointTransferType::Bulk)
         {
             static constexpr auto Settle = std::chrono::microseconds{120};
-            statusSet(ReadyMask);
+            apply(set(ReadySet{}));
             std::size_t count = received();
             auto        since = Clock::now();
             while(Clock::now() - since < Settle) {
@@ -404,11 +401,11 @@ public:
             return n;
         }
 
-        static void stall() { statusSet(StallMask); }
+        static void stall() { apply(set(StallSet{})); }
 
-        static void clearStall() { statusClear(StallMask); }
+        static void clearStall() { apply(set(StallClear{})); }
 
-        static void resetDataToggle() { statusClear(ToggleMask); }
+        static void resetDataToggle() { apply(set(ToggleClear{})); }
 
         static void reset() { resetDataToggle(); }
 
@@ -418,9 +415,9 @@ public:
         static std::size_t cancel() {
             if constexpr(IsIn) {
                 bool const armed = withController();
-                statusClear(ReadyMask);
+                apply(set(ReadyClear{}));
                 bool const sent = completionPending();
-                apply(write(E::EPINTFLAG::FULLREGISTER, CompleteMask));
+                apply(Kvasir::Register::reset(Complete{}));
                 // A transfer of several packets may have gone out in part: the module counts
                 // what it sent in MULTI_PACKET_SIZE, a packet at a time (32.6.2.10).
                 sentOfCancelled_ = armed && !sent ? (bank().pcksize >> detail::MultiPacketPos)
@@ -428,7 +425,7 @@ public:
                                                   : 0;
                 return armed && !sent ? 1 : 0;
             } else {
-                statusSet(ReadyMask);
+                apply(set(ReadySet{}));
                 return 0;
             }
         }
@@ -440,28 +437,30 @@ private:
     template<std::size_t N,
              typename Sink>
     static void dispatchEndpoint() {
-        using E                  = typename Traits::template Endpoint<N>;
-        std::uint8_t const flags = apply(read(E::EPINTFLAG::FULLREGISTER));
+        using E = typename Traits::template Endpoint<N>;
+        // one read of EPINTFLAG
+        auto const flags
+          = apply(read(E::EPINTFLAG::trcpt1, E::EPINTFLAG::trcpt0, E::EPINTFLAG::rxstp));
 
         // Each flag is cleared before its endpoint is told, so that the handler can arm the
         // endpoint again. What completed first is reported first: a SETUP last.
-        if(flags & E::EPINTFLAG::trcpt1.Mask) {
-            apply(write(E::EPINTFLAG::FULLREGISTER, E::EPINTFLAG::trcpt1.Mask));
+        if(get<0>(flags) != 0) {
+            apply(reset(E::EPINTFLAG::trcpt1));
             Sink::transferComplete(N, true);
         }
-        if(flags & E::EPINTFLAG::trcpt0.Mask) {
-            apply(write(E::EPINTFLAG::FULLREGISTER, E::EPINTFLAG::trcpt0.Mask));
+        if(get<1>(flags) != 0) {
+            apply(reset(E::EPINTFLAG::trcpt0));
             Sink::transferComplete(N, false);
         }
         if constexpr(N == 0) {
-            if(flags & E::EPINTFLAG::rxstp.Mask) {
+            if(get<2>(flags) != 0) {
                 // The 8 bytes are in endpoint 0's OUT buffer, and the next SETUP is only taken
                 // once this flag is clear (32.6.2.6) - so the packet is read first.
                 SetupPacket pkt;
                 detail::copyFromModule(
                   std::span{reinterpret_cast<std::byte*>(std::addressof(pkt)), sizeof(pkt)},
                   EP0_OUT::buffer.data());
-                apply(write(E::EPINTFLAG::FULLREGISTER, E::EPINTFLAG::rxstp.Mask));
+                apply(reset(E::EPINTFLAG::rxstp));
                 Sink::setup(pkt);
             }
         }
@@ -483,18 +482,22 @@ private:
 public:
     template<typename Sink>
     static void dispatchEvents() {
-        std::uint16_t const flags = apply(read(Regs::INTFLAG::FULLREGISTER));
+        // one read of INTFLAG
+        auto const flags = apply(read(Regs::INTFLAG::sof,
+                                      Regs::INTFLAG::eorst,
+                                      Regs::INTFLAG::suspend,
+                                      Regs::INTFLAG::wakeup));
 
         if constexpr(CfgTraits::UseSof) {
-            if(flags & Regs::INTFLAG::sof.Mask) {
-                apply(write(Regs::INTFLAG::FULLREGISTER, Regs::INTFLAG::sof.Mask));
+            if(get<0>(flags) != 0) {
+                apply(reset(Regs::INTFLAG::sof));
                 std::uint16_t const frame = apply(read(Regs::FNUM::fnum));
                 Sink::startOfFrame(frame);
             }
         }
 
-        if(flags & Regs::INTFLAG::eorst.Mask) {
-            apply(write(Regs::INTFLAG::FULLREGISTER, Regs::INTFLAG::eorst.Mask));
+        if(get<1>(flags) != 0) {
+            apply(reset(Regs::INTFLAG::eorst));
             // The reset disabled every endpoint but 0 and every endpoint interrupt, 0's too, and
             // cleared the address (32.6.2.4): the device sets the endpoints up again in there.
             Sink::busReset();
@@ -505,24 +508,22 @@ public:
         // its idle state by being set, and is "cleared on wakeup" by the module (32.6.2.13,
         // figures 32-7 and 32-8) - so it is not acknowledged here but masked, until WAKEUP (which
         // software does clear) says the bus is active again.
-        std::uint16_t const enabled = apply(read(Regs::INTENSET::FULLREGISTER));
-        if(flags & enabled & Regs::INTFLAG::suspend.Mask) {
-            apply(write(Regs::INTENCLR::FULLREGISTER, Regs::INTENCLR::suspend.Mask));
-            apply(write(Regs::INTFLAG::FULLREGISTER, Regs::INTFLAG::wakeup.Mask));
-            apply(write(Regs::INTENSET::FULLREGISTER, Regs::INTENSET::wakeup.Mask));
+        auto const enabled = apply(read(Regs::INTENSET::suspend, Regs::INTENSET::wakeup));
+        if((get<2>(flags) & get<0>(enabled)) != 0) {
+            apply(set(Regs::INTENCLR::suspend));
+            apply(reset(Regs::INTFLAG::wakeup));
+            apply(set(Regs::INTENSET::wakeup));
             Sink::suspend();
-        } else if(flags & enabled & Regs::INTFLAG::wakeup.Mask) {
-            apply(write(Regs::INTENCLR::FULLREGISTER, Regs::INTENCLR::wakeup.Mask));
+        } else if((get<3>(flags) & get<1>(enabled)) != 0) {
+            apply(set(Regs::INTENCLR::wakeup));
             // SUSPEND goes with it. Figure 32-8 says the module clears it on wakeup, the register
             // description says "this flag is cleared by writing a one to the flag" - and on the
             // SAM D21 it was still set here: enabling its interrupt again fired it
             // at once, that enabled WAKEUP, the next token on the bus set that, and so on - two
             // interrupts per frame on an idle bus, 36 000 to 119 000 a second under traffic,
             // a third to nine tenths of the core. Found by counting the interrupt's entries.
-            apply(write(Regs::INTFLAG::FULLREGISTER,
-                        static_cast<std::uint16_t>(Regs::INTFLAG::wakeup.Mask
-                                                   | Regs::INTFLAG::suspend.Mask)));
-            apply(write(Regs::INTENSET::FULLREGISTER, Regs::INTENSET::suspend.Mask));
+            apply(reset(Regs::INTFLAG::wakeup, Regs::INTFLAG::suspend));
+            apply(set(Regs::INTENSET::suspend));
             Sink::resume();
         }
 
@@ -533,9 +534,12 @@ public:
     // DADD.ADDEN: "should be written to one to accept communications directed to this address"
     // (32.6.2.1); address 0, after a reset, is ADDEN clear.
     static void setAddress(std::uint8_t address) {
-        apply(
-          write(Regs::DADD::FULLREGISTER,
-                static_cast<std::uint8_t>(address == 0 ? 0 : (address | Regs::DADD::adden.Mask))));
+        if(address == 0) {
+            apply(write(Regs::DADD::dadd, Kvasir::Register::value<std::uint8_t, 0>()),
+                  clear(Regs::DADD::adden));
+        } else {
+            apply(write(Regs::DADD::dadd, address), set(Regs::DADD::adden));
+        }
     }
 
     // The module has done it all by the time RXSTP is set: "DTGLOUT, DTGLIN, CURRBK and BK0RDY
@@ -551,7 +555,7 @@ public:
     // full speed, the descriptor table, and the module enabled - still detached (CTRLB.DETACH is
     // set after a reset), so that the endpoints can be set up before the host sees the device.
     static void prepare() {
-        apply(write(Regs::CTRLA::FULLREGISTER, Regs::CTRLA::swrst.Mask));
+        apply(Regs::CTRLA::overrideDefaults(set(Regs::CTRLA::swrst)));
         if(!waitSync()) {
             clockMissing = true;
             UC_LOG_E(
@@ -577,10 +581,11 @@ public:
                     reinterpret_cast<std::uint32_t>(std::addressof(detail::descriptorTable[0]))));
 
         apply(write(Regs::CTRLB::SPDCONFValC::fs));
-        static constexpr std::uint16_t Interrupts
-          = Regs::INTENSET::eorst.Mask | Regs::INTENSET::suspend.Mask
-          | (CfgTraits::UseSof ? Regs::INTENSET::sof.Mask : 0);
-        apply(write(Regs::INTENSET::FULLREGISTER, Interrupts));
+        if constexpr(CfgTraits::UseSof) {
+            apply(set(Regs::INTENSET::eorst, Regs::INTENSET::suspend, Regs::INTENSET::sof));
+        } else {
+            apply(set(Regs::INTENSET::eorst, Regs::INTENSET::suspend));
+        }
 
         apply(write(Regs::CTRLA::MODEValC::device), set(Regs::CTRLA::enable));
         static_cast<void>(waitSync());
