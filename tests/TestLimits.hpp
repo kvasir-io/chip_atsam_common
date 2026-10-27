@@ -7,18 +7,18 @@
 
 namespace Kvasir::ClockLimits::Test {
 // D21-shaped: f_IN 32..2000 kHz, DCO 48..96 MHz, LDR 12 bits, LDRFRAC 4 bits, DIV 11 bits
-inline constexpr Dpll                   Plain{.refMin   = 32'000,
-                                              .refMax   = 2'000'000,
-                                              .outMin   = 48'000'000,
-                                              .outMax   = 96'000'000,
-                                              .ldrBits  = 12,
-                                              .fracBits = 4,
-                                              .divBits  = 11,
-                                              .prescMax = 0};
-inline constexpr Prescaler::FixedString PlainWhere = "test DPLL";
+inline constexpr Dpll                    plain{.refMin   = 32'000,
+                                               .refMax   = 2'000'000,
+                                               .outMin   = 48'000'000,
+                                               .outMax   = 96'000'000,
+                                               .ldrBits  = 12,
+                                               .fracBits = 4,
+                                               .divBits  = 11,
+                                               .prescMax = 0};
+inline constexpr Diagnostic::FixedString plainWhere = "test DPLL";
 
 // C21-shaped: the same with an output prescaler up to /4
-inline constexpr Dpll WithPresc{.refMin   = 32'000,
+inline constexpr Dpll withPresc{.refMin   = 32'000,
                                 .refMax   = 2'000'000,
                                 .outMin   = 48'000'000,
                                 .outMax   = 96'000'000,
@@ -28,7 +28,7 @@ inline constexpr Dpll WithPresc{.refMin   = 32'000,
                                 .prescMax = 2};
 
 // E5x-shaped: f_IN 32..3200 kHz, DCO 96..200 MHz, LDR 13 bits, LDRFRAC 5 bits
-inline constexpr Dpll Fine{.refMin   = 32'000,
+inline constexpr Dpll fine{.refMin   = 32'000,
                            .refMax   = 3'200'000,
                            .outMin   = 96'000'000,
                            .outMax   = 200'000'000,
@@ -38,20 +38,20 @@ inline constexpr Dpll Fine{.refMin   = 32'000,
                            .prescMax = 0};
 
 // two supply rows, one with a short list
-inline constexpr WaitStateTable WaitStates{
+inline constexpr WaitStateTable waitStates{
   "test table",
   {{
     {Supply::from1V62, {14'000'000, 28'000'000, 42'000'000, 48'000'000}},
     {Supply::from2V7, {24'000'000, 48'000'000}},
   }}};
 // one row only
-inline constexpr WaitStateTable WaitStatesOneRow{"test table, one row",
+inline constexpr WaitStateTable waitStatesOneRow{"test table, one row",
                                                  {{
                                                    {Supply::from2V7, {24'000'000, 40'000'000}},
                                                    {},
                                                  }}};
 
-inline constexpr Dfll Dfll48{.refMin     = 732,
+inline constexpr Dfll dfll48{.refMin     = 732,
                              .refMax     = 33'000,
                              .mulBits    = 16,
                              .coarseBits = 6,

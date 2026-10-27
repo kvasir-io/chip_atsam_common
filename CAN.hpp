@@ -1,15 +1,29 @@
 #pragma once
 
-#include "chip/CAN_Traits.hpp"
+// The CAN controller exists on the SAM C21 and E5x only: the SAM D21 has none (SAM D21/DA1 family datasheet, 1
+// "Description": the peripheral list names no CAN, nor does any chapter), so its chip package says hasCan = false and
+// has no Can (atsam_common/ChipTraits.hpp's ChipPackage). Asserted before the other includes: on the D21 it is the
+// first error, ahead of the missing peripherals/CAN.hpp.
+#include "chip/Package.hpp"
+
+static_assert(
+  Kvasir::Sam::Package::hasCan,
+  "the CAN exists on the SAM C21/E5x only (SAM D21/DA1 datasheet, 1 Description: no CAN)");
+
 #include "chip/Interrupt.hpp"
-#include "chip/Io.hpp"
+#include "chip/PM.hpp"
+#include "chip/atsam_common/CanBitTiming.hpp"
+#include "chip/atsam_common/Clocks.hpp"
+#include "chip/atsam_common/Io.hpp"
 #include "core/Nvic.hpp"
+#include "kvasir/Hal/Clocks.hpp"
+#include "kvasir/Hal/Owns.hpp"
 #include "kvasir/Register/Register.hpp"
+#include "kvasir/Util/Config.hpp"
 #include "kvasir/Util/Prescaler.hpp"
 #include "kvasir/Util/attributes.hpp"
-#include "kvasir/Util/using_literals.hpp"
+#include "kvasir/Util/literals.hpp"
 #include "peripherals/CAN.hpp"
-#include "uc_log/uc_log.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -17,191 +31,131 @@
 #include <optional>
 
 namespace Kvasir { namespace CAN {
+    using namespace Kvasir::literals;
+    using CanTraits = Kvasir::Sam::Package::Can;
 
+    // One message RAM element: an Rx Buffer/FIFO element (R0, R1, data) or a Tx Buffer element (T0, T1, data) - the
+    // same bits in both (C21 DS60001479M 34.9.2 / 34.9.3, md l.33266/33292/33322 and l.33392/33406/33444; E5x
+    // DS60001507N 39.9.2 / 39.9.3, md l.54918/54932/54958 and l.55024/55036/55072).
     struct CanMessage {
-        constexpr std::uint32_t id() const {
-            if((F0 & 0x40000000) != 0) { return F0 & 0x1FFFFFFF; }
-            return (F0 & 0x1FFFFFFF) >> 18;
+        static constexpr std::uint32_t xtd    = 1U << 30;   // R0/T0 bit 30 XTD: a 29-bit identifier
+        static constexpr std::uint32_t idMask = 0x1FFF'FFFFU;   // R0/T0 bits 28:0 ID
+        static constexpr unsigned      standardShift
+          = 18;   // "A standard identifier ... into ID[28:18]"
+        static constexpr std::uint32_t standardMax = 0x7FFU;   // 11 bits
+        static constexpr unsigned      dlcShift    = 16;       // R1/T1 bits 19:16 DLC
+        static constexpr std::uint32_t dlcMask     = 0xFU << dlcShift;
+
+        [[nodiscard]] constexpr std::uint32_t id() const {
+            if((f0 & xtd) != 0) { return f0 & idMask; }
+            return (f0 & idMask) >> standardShift;
         }
 
-        constexpr std::uint32_t size() const { return (F1 & 0x000F0000_u32) >> 16_u32; }
+        [[nodiscard]] constexpr std::uint32_t size() const { return (f1 & dlcMask) >> dlcShift; }
 
         constexpr void setId(std::uint32_t id) {
-            if(id > 0x7FF) {
-                F0 = (id & 0x1FFFFFFF) | 0x40000000;
+            if(id > standardMax) {
+                f0 = (id & idMask) | xtd;
             } else {
-                F0 = (id & 0x7FF) << 18;
+                f0 = (id & standardMax) << standardShift;
             }
         }
 
         constexpr void setSize(std::uint8_t size) {
-            F1 = static_cast<std::uint32_t>(size << 16_u32);
+            f1 = static_cast<std::uint32_t>(size << dlcShift);
         }
 
         constexpr auto begin() { return data.begin(); }
 
         constexpr auto end() { return std::next(data.begin(), static_cast<int>(size())); }
 
-        constexpr auto begin() const { return data.begin(); }
+        [[nodiscard]] constexpr auto begin() const { return data.begin(); }
 
-        constexpr auto end() const { return std::next(data.begin(), static_cast<int>(size())); }
+        [[nodiscard]] constexpr auto end() const {
+            return std::next(data.begin(), static_cast<int>(size()));
+        }
 
-        std::uint32_t            F0{};
-        std::uint32_t            F1{};
+        std::uint32_t            f0{};
+        std::uint32_t            f1{};
         std::array<std::byte, 8> data{};
     };
 
     static_assert(sizeof(CanMessage) == 16);
 
     struct CanFilter {
-        enum class FilterType { Range = 0, Dual = 1, Classic = 3 };
+        enum class FilterType { range = 0, dual = 1, classic = 3 };
 
         enum class FilterConfig {
-            Disable     = 0,
-            StoreFifo0  = 1,
-            StoreFifo1  = 2,
-            Reject      = 3,
-            Priority    = 4,
-            PrioFifi0   = 5,
-            PrioFifi1   = 6,
-            StoreBuffer = 7
+            disable       = 0,
+            storeFifo0    = 1,
+            storeFifo1    = 2,
+            reject        = 3,
+            priority      = 4,
+            priorityFifo0 = 5,
+            priorityFifo1 = 6,
+            storeBuffer   = 7
         };
 
         std::uint32_t value{};
 
         constexpr void setId(std::uint32_t id) {
             assert(2047 >= id);
-            value = (static_cast<std::uint32_t>(FilterType::Range) << 30)
-                  | (static_cast<std::uint32_t>(FilterConfig::StoreFifo0) << 27) | id << 16 | id;
+            value = (static_cast<std::uint32_t>(FilterType::range) << 30)
+                  | (static_cast<std::uint32_t>(FilterConfig::storeFifo0) << 27) | id << 16 | id;
         }
 
         constexpr void disable() {
-            value = static_cast<std::uint32_t>(FilterConfig::Disable) << 27;
+            value = static_cast<std::uint32_t>(FilterConfig::disable) << 27;
         }
     };
 
     static_assert(sizeof(CanFilter) == 4);
 
     namespace Detail {
-        /// The M_CAN's nominal bit timing (NBTP; SAM C20/C21 DS60001479 and D5x/E5x data sheets, CAN
-        /// NBTP): a time quantum is NBRP + 1 GCLK_CAN periods, a bit is 1 + (NTSEG1 + 1) + (NTSEG2
-        /// + 1) quanta, 4 to 385; NBRP 0..511, NTSEG1 1..255, NTSEG2 0..127, NSJW 0..127, each field
-        /// used as one more than written.
-        struct BitTiming {
-            std::uint32_t       nbrp{};
-            std::uint32_t       ntseg1{};
-            std::uint32_t       ntseg2{};
-            std::uint32_t       nsjw{};
-            Prescaler::Rational achieved{};
-            bool                found{};
-        };
-
-        /// The prescaler whose bit is closest to `baud` in rate, the smallest prescaler (most
-        /// quanta) on a tie; the sample point at `samplePointPermille` of the bit (sync segment
-        /// included), rounded to a quantum; the jump width as wide as phase segment 2. 8 MHz,
-        /// 500 kbit/s, 750 give the reset value 0x06000A03 (16 quanta, 12 before the sample point).
-        consteval BitTiming bitTiming(std::uint32_t clock,
-                                      std::uint32_t baud,
-                                      std::uint32_t samplePointPermille) {
-            BitTiming best{};
-            for(std::uint64_t pre = 1; pre <= 512; ++pre) {
-                std::uint64_t const quanta = (clock + pre * baud / 2) / (pre * baud);
-                if(quanta < 4 || quanta > 385) { continue; }
-                std::uint64_t const beforeSample = (quanta * samplePointPermille + 500) / 1000;
-                std::uint64_t const seg2 = std::clamp<std::uint64_t>(quanta - beforeSample, 1, 128);
-                std::uint64_t const seg1 = quanta - 1 - seg2;
-                if(seg1 < 2 || seg1 > 256) { continue; }
-                Prescaler::Rational const achieved{clock, pre * quanta};
-                auto const                error = [&](Prescaler::Rational const& r) {
-                    // |r - baud| * den, compared across candidates as |num - baud den| / den
-                    return r.num > baud * r.den ? r.num - baud * r.den : baud * r.den - r.num;
-                };
-                if(best.found
-                   && error(achieved) * best.achieved.den >= error(best.achieved) * achieved.den)
-                {
-                    continue;
-                }
-                best = BitTiming{.nbrp     = static_cast<std::uint32_t>(pre - 1),
-                                 .ntseg1   = static_cast<std::uint32_t>(seg1 - 1),
-                                 .ntseg2   = static_cast<std::uint32_t>(seg2 - 1),
-                                 .nsjw     = static_cast<std::uint32_t>(std::min(seg1, seg2) - 1),
-                                 .achieved = achieved,
-                                 .found    = true};
-            }
-            return best;
-        }
-
-        template<unsigned CanInstance, typename RXPIN>
-        struct GetRxPinConfig;
-
-        template<unsigned CanInstance, int Port, int Pin>
-        struct GetRxPinConfig<CanInstance, Kvasir::Register::PinLocation<Port, Pin>> {
-            using pinConfig = decltype(action(
-              Kvasir::Io::Action::PinFunction<Traits::CanTraits::GetPinFunction<CanInstance>(
-                Register::PinLocation<Port, Pin>{})>{},
-              Register::PinLocation<Port, Pin>{}));
-        };
-
-        template<unsigned CanInstance, typename TXPIN>
-        struct GetTxPinConfig;
-
-        template<unsigned CanInstance, int Port, int Pin>
-        struct GetTxPinConfig<CanInstance, Kvasir::Register::PinLocation<Port, Pin>> {
-            using pinConfig = decltype(action(
-              Kvasir::Io::Action::PinFunction<Traits::CanTraits::GetPinFunction<CanInstance>(
-                Register::PinLocation<Port, Pin>{})>{},
-              Register::PinLocation<Port, Pin>{}));
-        };
-
         template<typename CANConfig_>
         struct CANBase {
+            static constexpr auto maxRxSize     = 64;
+            static constexpr auto maxTxSize     = 32;
+            static constexpr auto maxFilterSize = 128;
+
             struct CANConfig : CANConfig_ {
-                static constexpr auto userConfigOverride = [] {
-                    if constexpr(requires { CANConfig_::userConfigOverride; }) {
-                        return CANConfig_::userConfigOverride;
-                    } else {
-                        return brigand::list<>{};
-                    }
-                }();
+                static constexpr auto userConfigOverride
+                  = KVASIR_CONFIG_OR(CANConfig_, userConfigOverride, brigand::list<>{});
 
                 // the achieved bit rate against this (the bus needs every node within ~0.5 %)
-                static constexpr auto maxBaudRateError = [] {
-                    if constexpr(requires { CANConfig_::maxBaudRateError; }) {
-                        return CANConfig_::maxBaudRateError;
-                    } else {
-                        return std::ratio<1, 1000>{};
-                    }
-                }();
+                static constexpr auto maxBaudRateError
+                  = KVASIR_CONFIG_OR(CANConfig_, maxBaudRateError, std::ratio<1, 1000>{});
                 // where the bus is sampled, in 1/1000 of a bit; 750 is the reset value's
-                static constexpr std::uint32_t samplePointPermille = [] {
-                    if constexpr(requires { CANConfig_::samplePointPermille; }) {
-                        return CANConfig_::samplePointPermille;
-                    } else {
-                        return 750U;
-                    }
-                }();
-                static constexpr auto rejectNonMatching = [] {
-                    if constexpr(requires { CANConfig_::rejectNonMatching; }) {
-                        return CANConfig_::rejectNonMatching;
-                    } else {
-                        return false;
-                    }
-                }();
+                static constexpr std::uint32_t samplePointPermille
+                  = KVASIR_CONFIG_OR(CANConfig_, samplePointPermille, 750U);
+                static constexpr auto rejectNonMatching
+                  = KVASIR_CONFIG_OR(CANConfig_, rejectNonMatching, false);
+
+                // message RAM elements: the RX FIFO 0, the TX FIFO and the standard filters; the filters default to all
+                // of them when frames that match none are rejected (nothing would be received without a filter), else 0
+                static constexpr auto rxSize = KVASIR_CONFIG_OR(CANConfig_, rxSize, maxRxSize);
+                static constexpr auto txSize = KVASIR_CONFIG_OR(CANConfig_, txSize, maxTxSize);
+                static constexpr auto filterSize
+                  = KVASIR_CONFIG_OR(CANConfig_, filterSize, rejectNonMatching ? maxFilterSize : 0);
             };
 
-            static constexpr auto Instance = CANConfig::instance;
-            using Regs                     = Peripheral::CAN::Registers<Instance>;
-            using InterruptIndexs = decltype(Traits::CanTraits::getCanIsrIndexs<Instance>());
+            static constexpr auto instance = CANConfig::instance;
+            using Regs                     = Peripheral::CAN::Registers<instance>;
+            // Startup: this CAN, and the clock its bit timing counts (Clocks.hpp: the
+            // ClockSettings must route a generator at clockSpeed to GCLK_CANn and provide it).
+            using Provides        = brigand::list<Hal::Owns<Regs>>;
+            using Claims          = Hal::Claim<Clocks::ClkCan<instance>, CANConfig::clockSpeed>;
+            using InterruptIndexs = decltype(Sam::Block<Regs>::irqs());
 
             // clockSpeed is GCLK_CAN's
-            static constexpr BitTiming Timing = bitTiming(CANConfig::clockSpeed,
+            static constexpr BitTiming timing = bitTiming(CANConfig::clockSpeed,
                                                           CANConfig::baudRate,
                                                           CANConfig::samplePointPermille);
-            static_assert(Timing.found,
+            static_assert(timing.found,
                           "no CAN bit timing: baudRate needs 4 to 385 time quanta of 1 to 512 "
                           "GCLK_CAN periods");
-            static constexpr bool BitRateInTolerance = [] {
-                Prescaler::assertInTolerance<Timing.achieved,
+            static constexpr bool bitRateInTolerance = [] {
+                Prescaler::assertInTolerance<timing.achieved,
                                              CANConfig::baudRate,
                                              Prescaler::Tolerance{CANConfig::maxBaudRateError},
                                              "CAN bit rate">();
@@ -209,7 +163,7 @@ namespace Kvasir { namespace CAN {
             }();
             // a static data member of a class template is initialised only when used: this use
             // is what runs the check
-            static_assert(BitRateInTolerance);
+            static_assert(bitRateInTolerance);
 
             static constexpr auto rejectConfig = []() {
                 if constexpr(CANConfig::rejectNonMatching) {
@@ -223,74 +177,30 @@ namespace Kvasir { namespace CAN {
             }();
 
             static constexpr auto powerClockEnable
-              = list(typename PM::enable<Regs::baseAddr>::action{});
+              = list(typename PM::Enable<Regs::baseAddr>::action{});
 
-            static_assert(Traits::CanTraits::isRX<Instance>(CANConfig::rxPinLocation));
-            static_assert(Traits::CanTraits::isTX<Instance>(CANConfig::txPinLocation));
+            static_assert(CanTraits::isRX<instance>(CANConfig::rxPinLocation));
+            static_assert(CanTraits::isTX<instance>(CANConfig::txPinLocation));
 
-            static constexpr auto initStepPinConfig = list(
-              typename GetRxPinConfig<Instance, std::decay_t<decltype(CANConfig::rxPinLocation)>>::
-                pinConfig{},
-              typename GetTxPinConfig<Instance, std::decay_t<decltype(CANConfig::txPinLocation)>>::
-                pinConfig{});
+            static constexpr auto initStepPinConfig
+              = list(Sam::PinFunctionOf<CanTraits, instance, decltype(CANConfig::rxPinLocation)>{},
+                     Sam::PinFunctionOf<CanTraits, instance, decltype(CANConfig::txPinLocation)>{});
 
-            static constexpr auto initStepPeripheryConfig = list(
-              //       Regs::BAUD::overrideDefaults(
-              //       typename GetBaudConfig<Regs, CANConfig::clockSpeed, CANConfig::baudRate>::config{}),
-
-              //  Regs::CTRLA::overrideDefaults(
-              //  write(Regs::CTRLA::MODEValC::i2c_master),
-              //  write(getSpeedConfig<Regs, I2CConfig::baudRate>())),
-              //  set(Regs::INTENSET::mb),
-              //  set(Regs::INTENSET::sb),
-              //  set(Regs::INTENSET::error),
-
-              set(Regs::CCCR::init),
-              Register::SequencePoint{},
-              set(Regs::CCCR::cce),
-              Register::SequencePoint{},
-              // NBTP is writable only with CCCR.CCE and INIT set (NBTP, "Write-restricted")
-              Regs::NBTP::overrideDefaults(
-                write(Regs::NBTP::nbrp, Register::value<Timing.nbrp>()),
-                write(Regs::NBTP::ntseg1, Register::value<Timing.ntseg1>()),
-                write(Regs::NBTP::ntseg2, Register::value<Timing.ntseg2>()),
-                write(Regs::NBTP::nsjw, Register::value<Timing.nsjw>())),
-              set(Regs::IE::rf0le),
-              rejectConfig,
-              //set(Regs::IE::rf0ne),
-              /*     set(Regs::IE::rf0ne),
-              set(Regs::IE::rf0we),
-              set(Regs::IE::rf0fe),
-              set(Regs::IE::rf0le),
-              set(Regs::IE::rf1ne),
-              set(Regs::IE::rf1we),
-              set(Regs::IE::rf1fe),
-              set(Regs::IE::rf1le),
-              set(Regs::IE::hpme),
-              set(Regs::IE::tce),
-              set(Regs::IE::tcfe),
-              set(Regs::IE::tfee),
-              set(Regs::IE::tefne),
-              set(Regs::IE::tefne),
-              set(Regs::IE::tefwe),
-              set(Regs::IE::tefle),
-              set(Regs::IE::tswe),
-              set(Regs::IE::mrafe),
-              set(Regs::IE::tooe),
-              set(Regs::IE::drxe),
-              set(Regs::IE::bece),
-              set(Regs::IE::beue),
-              set(Regs::IE::eloe),
-              set(Regs::IE::epe),
-              set(Regs::IE::ewe),
-              set(Regs::IE::boe),
-              set(Regs::IE::wdie),
-              set(Regs::IE::peae),
-              set(Regs::IE::pede),
-              set(Regs::IE::arae),
-*/
-              set(Regs::ILE::eint0),
-              CANConfig::userConfigOverride);
+            static constexpr auto initStepPeripheryConfig
+              = list(set(Regs::CCCR::init),
+                     Register::SequencePoint{},
+                     set(Regs::CCCR::cce),
+                     Register::SequencePoint{},
+                     // NBTP is writable only with CCCR.CCE and INIT set (NBTP, "Write-restricted")
+                     Regs::NBTP::overrideDefaults(
+                       write(Regs::NBTP::nbrp, Register::value<timing.nbrp>()),
+                       write(Regs::NBTP::ntseg1, Register::value<timing.ntseg1>()),
+                       write(Regs::NBTP::ntseg2, Register::value<timing.ntseg2>()),
+                       write(Regs::NBTP::nsjw, Register::value<timing.nsjw>())),
+                     set(Regs::IE::rf0le),
+                     rejectConfig,
+                     set(Regs::ILE::eint0),
+                     CANConfig::userConfigOverride);
             static constexpr auto initStepInterruptConfig
               = list(Nvic::makeSetPriority<CANConfig::isrPriority>(InterruptIndexs{}),
                      Nvic::makeClearPending(InterruptIndexs{}));
@@ -304,99 +214,66 @@ namespace Kvasir { namespace CAN {
     struct CANBehavior : Detail::CANBase<CANConfig_> {
         using base       = Detail::CANBase<CANConfig_>;
         using Regs       = typename base::Regs;
-        using tp         = typename Clock::time_point;
         using CanMessage = ::Kvasir::CAN::CanMessage;
 
-        static constexpr auto MaxRxSize     = 64;
-        static constexpr auto MaxTxSize     = 32;
-        static constexpr auto MaxFilterSize = 128;
+        using CANConfig = typename base::CANConfig;
+        using base::maxFilterSize;
+        using base::maxRxSize;
+        using base::maxTxSize;
 
-        struct CANConfig : CANConfig_ {
-            static constexpr auto rxSize = [] {
-                if constexpr(requires { CANConfig_::rxSize; }) {
-                    return CANConfig_::rxSize;
-                } else {
-                    return MaxRxSize;
-                }
-            }();
+        static constexpr std::size_t rxSize     = CANConfig::rxSize;
+        static constexpr std::size_t txSize     = CANConfig::txSize;
+        static constexpr std::size_t filterSize = CANConfig::filterSize;
 
-            static constexpr auto txSize = [] {
-                if constexpr(requires { CANConfig_::txSize; }) {
-                    return CANConfig_::txSize;
-                } else {
-                    return MaxTxSize;
-                }
-            }();
-            static constexpr auto filterSize = [] {
-                if constexpr(requires { CANConfig_::filterSize; }) {
-                    return CANConfig_::filterSize;
-                } else {
-                    if constexpr(requires { CANConfig_::rejectNonMatching; }) {
-                        return MaxFilterSize;
-                    } else {
-                        return 0;
-                    }
-                }
-            }();
-        };
-
-        static constexpr std::size_t RxSize     = CANConfig::rxSize;
-        static constexpr std::size_t TxSize     = CANConfig::txSize;
-        static constexpr std::size_t FilterSize = CANConfig::filterSize;
-
-        static_assert(MaxRxSize >= RxSize,
-                      "rx size to big");
-        static_assert(MaxTxSize >= TxSize,
-                      "tx size to big");
-        static_assert(MaxFilterSize >= FilterSize,
-                      "filter size to big");
+        static_assert(maxRxSize >= rxSize,
+                      "CAN: rxSize above the RX FIFO elements of the message RAM (MaxRxSize)");
+        static_assert(maxTxSize >= txSize,
+                      "CAN: txSize above the TX buffer elements of the message RAM (MaxTxSize)");
+        static_assert(
+          maxFilterSize >= filterSize,
+          "CAN: filterSize above the standard filter elements of the message RAM (MaxFilterSize)");
 
         [[KVASIR_SECTION_MEMBER(
-          ".noInitLowRam")]] static inline std::array<CanMessage, RxSize>    RxFIFO{};
+          ".noInitLowRam")]] static inline std::array<CanMessage, rxSize>    rxFIFO{};
         [[KVASIR_SECTION_MEMBER(
-          ".noInitLowRam")]] static inline std::array<CanMessage, TxSize>    TxFIFO{};
+          ".noInitLowRam")]] static inline std::array<CanMessage, txSize>    txFIFO{};
         [[KVASIR_SECTION_MEMBER(
-          ".noInitLowRam")]] static inline std::array<CanFilter, FilterSize> Filter{};
+          ".noInitLowRam")]] static inline std::array<CanFilter, filterSize> filter{};
 
         static void runtimeInit() {
             std::uint32_t const rx
-              = reinterpret_cast<std::uint32_t>(std::addressof(RxFIFO)) & 0x0000FFFF_u32;
+              = reinterpret_cast<std::uint32_t>(std::addressof(rxFIFO)) & 0x0000FFFF_u32;
             std::uint32_t const tx
-              = reinterpret_cast<std::uint32_t>(std::addressof(TxFIFO)) & 0x0000FFFF_u32;
-            std::uint32_t const filter
-              = reinterpret_cast<std::uint32_t>(std::addressof(Filter)) & 0x0000FFFF_u32;
+              = reinterpret_cast<std::uint32_t>(std::addressof(txFIFO)) & 0x0000FFFF_u32;
+            std::uint32_t const filterAddress
+              = reinterpret_cast<std::uint32_t>(std::addressof(filter)) & 0x0000FFFF_u32;
 
             apply(write(Regs::RXF0C::f0sa, rx),
-                  write(Regs::RXF0C::f0s, Kvasir::Register::value<RxSize>()));
+                  write(Regs::RXF0C::f0s, Kvasir::Register::value<rxSize>()));
 
             apply(write(Regs::TXBC::tbsa, tx),
-                  write(Regs::TXBC::tfqs, Kvasir::Register::value<TxSize>()));
+                  write(Regs::TXBC::tfqs, Kvasir::Register::value<txSize>()));
 
-            apply(write(Regs::SIDFC::flssa, filter),
-                  write(Regs::SIDFC::lss, Kvasir::Register::value<FilterSize>()));
+            apply(write(Regs::SIDFC::flssa, filterAddress),
+                  write(Regs::SIDFC::lss, Kvasir::Register::value<filterSize>()));
 
-            for(auto& f : Filter) { f.disable(); }
+            for(auto& f : filter) { f.disable(); }
 
             apply(clear(Regs::CCCR::init));
         }
 
         static void setFilter(std::uint8_t  number,
                               std::uint32_t id) {
-            assert(FilterSize > number);
-            Filter[number].setId(id);
+            assert(filterSize > number);
+            filter[number].setId(id);
         }
 
         static bool send(CanMessage const& msg) {
             auto const state = apply(read(Regs::TXFQS::tfqpi), read(Regs::TXFQS::tffl));
             if(get<1>(state) == 0) { return false; }
-            TxFIFO[get<0>(state)] = msg;
+            txFIFO[get<0>(state)] = msg;
             apply(write(Regs::TXBAR::ar, 1_u32 << get<0>(state)));
             return true;
-        }
-
-        static bool transmissonComplete() {
-            auto const state = apply(read(Regs::TXFQS::tffl));
-            return get<0>(state) == TxSize;
         }
 
         static std::optional<CanMessage> recv() {
@@ -404,26 +281,32 @@ namespace Kvasir { namespace CAN {
             auto const state = apply(read(Regs::RXF0S::f0gi), read(Regs::RXF0S::f0fl));
             if(get<1>(state) == 0) { return ret; }
 
-            ret = RxFIFO[get<0>(state)];
+            ret = rxFIFO[get<0>(state)];
 
             apply(write(Regs::RXF0A::f0ai, get<0>(state)));
 
             return ret;
         }
 
-        // ISR
+        /// Losses of RX FIFO 0 (IR.RF0L, "Rx FIFO 0 Message Lost", C21 DS60001479M md l.31117): counted by the
+        /// interrupt, read in thread code - a reader that wants the frames empties the FIFO with recv() faster. One
+        /// count per time the flag is found set, at least one frame each: frames lost while the interrupt is masked or
+        /// pending count once.
+        [[nodiscard]] static std::uint32_t rxOverruns() { return rxOverruns_; }
+
+        // The only interrupt enabled (IE.RF0LE): a frame lost. IR.RF0L is write-one-to-clear, cleared only when it was
+        // read set: with an unconditional clear, a loss right after a read that found it clear went uncounted.
         static void onIsr() {
-            auto const state = apply(read(Regs::IR::rf0l));
-            if(get<0>(state)) { UC_LOG_T("CAN ISR overrrun {}", get<0>(state)); }
-            apply(set(Regs::IR::rf0l));
+            if(get<0>(apply(read(Regs::IR::rf0l))) != 0) {
+                rxOverruns_ = rxOverruns_ + 1U;
+                apply(set(Regs::IR::rf0l));
+            }
         }
 
-        template<typename... Ts>
-        static constexpr auto makeIsr(brigand::list<Ts...>) {
-            return brigand::list<
-              Kvasir::Nvic::Isr<std::addressof(onIsr), Nvic::Index<Ts::value>>...>{};
-        }
+        using Isr = Nvic::IsrsFor<std::addressof(onIsr), typename base::InterruptIndexs>;
 
-        using Isr = decltype(makeIsr(typename base::InterruptIndexs{}));
+    private:
+        // written by onIsr only, read anywhere: one word, volatile for the reader outside the interrupt
+        inline static std::uint32_t volatile rxOverruns_{};
     };
 }}   // namespace Kvasir::CAN

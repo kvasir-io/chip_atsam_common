@@ -1,5 +1,5 @@
 #pragma once
-// The SAM backend of Kvasir::ImageCheck (Kvasir_SDK kvasir/Util/ImageCheck.hpp): the Device Service Unit computes
+// The SAM backend of Kvasir::ImageCheck (Kvasir_SDK kvasir/Runtime/ImageCheck.hpp): the Device Service Unit computes
 // the CRC-32 over flash itself.
 //
 //     using ImageCheck = Kvasir::ImageCheck::Checker<Kvasir::ImageCheck::SamDsu<>,
@@ -21,13 +21,17 @@
 // own peripheral in the SVD (PAC0..PAC2, one field per protected peripheral, DS40001882L 11.6.2), the DSU on PAC1;
 // WPCLR.DSU is write-one-to-clear, a 0 does nothing (11.6.2.2.1).
 //
-// Synchronous: chunk() waits for DONE (bounded; a chunk that does not finish in TimeoutPolls resets the DSU,
-// CTRL.SWRST - "A running CRC32 operation can be canceled by resetting the module" - and fails: the checker drops
-// the pass). The CPU waits meanwhile; how long a DSU read of a flash word takes is measured, not given.
+// Synchronous: chunk() waits for DONE (bounded, whatever policy the application injects; a chunk that does not
+// finish in TimeoutUs - at the chip's ceiling clock - resets the DSU, CTRL.SWRST - "A running CRC32 operation can be
+// canceled by resetting the module" - and fails: the checker drops the pass). The CPU waits meanwhile; how long a DSU
+// read of a flash word takes is measured, not given (Sam::DsuCrcTimeoutUs in SamWaitBounds.hpp).
+#include "chip/WaitBounds.hpp"
+#include "kvasir/Register/Memory.hpp"
+#include "kvasir/Runtime/ImageCheck.hpp"
 #include "kvasir/Util/Crc.hpp"
-#include "kvasir/Util/ImageCheck.hpp"
 #include "peripherals/DSU.hpp"
-#if __has_include("peripherals/PAC1.hpp")   // SAM D21
+#if defined(                                                                                \
+  KVASIR_CHIP_ATSAMD21)   // the D21 has a PAC per bridge (PAC0..PAC2), the C21/E5x one PAC
     #include "peripherals/PAC1.hpp"
 #else
     #include "peripherals/PAC.hpp"
@@ -39,7 +43,7 @@
 
 namespace Kvasir::ImageCheck {
 
-template<std::uint32_t TimeoutPolls = 1'000'000>
+template<std::uint32_t TimeoutUs = Kvasir::Chip::Sam::dsuCrcTimeoutUs>
 struct SamDsu {
     using Dsu = Kvasir::Peripheral::DSU::Registers<>;
 
@@ -74,9 +78,13 @@ struct SamDsu {
     [[nodiscard]] static std::uint32_t result() { return ~running_; }
 
 private:
+    using Timeout = Kvasir::Register::MicrosecondsBound<TimeoutUs>;
+
     static bool finished() {
-        for(std::uint32_t i = 0; i != TimeoutPolls; ++i) {
-            if(apply(read(Dsu::STATUSA::done))) { return !apply(read(Dsu::STATUSA::berr)); }
+        if(Kvasir::Register::waitUntil<Timeout, Kvasir::Register::OnTimeout::Report>(
+             Kvasir::Register::isSet(Dsu::STATUSA::done)))
+        {
+            return apply(read(Dsu::STATUSA::berr)) == 0;
         }
         apply(set(Dsu::CTRL::swrst));   // cancels the CRC32
         return false;
@@ -87,7 +95,7 @@ private:
         if(n == 0) { return; }
         auto e = Kvasir::Crc::Crc32::resume(~running_);
         for(std::uint32_t i = 0; i != n; ++i) {
-            e.update(std::byte{*reinterpret_cast<std::uint8_t const volatile*>(a + i)});
+            e.update(std::byte{Kvasir::Memory::load<std::uint8_t>(a + i)});
         }
         running_ = ~e.finish();
     }
@@ -95,7 +103,7 @@ private:
     // the PAC differs: C21/E5x a WRCTRL key register, D21 a WPCLR/WPSET pair per bridge, each bridge's PAC its own
     // peripheral (PAC0..PAC2) - the other chip's names do not exist, hence #if, not if constexpr.
     static void unprotect() {
-#if __has_include("peripherals/PAC1.hpp")
+#ifdef KVASIR_CHIP_ATSAMD21
         using Pac1 = Kvasir::Peripheral::PAC1::Registers<>;
         if(apply(read(Pac1::WPSET::dsu))) { apply(set(Pac1::WPCLR::dsu)); }
 #else

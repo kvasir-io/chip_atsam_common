@@ -3,7 +3,8 @@
 // FDPLL settings for a wanted core clock, the flash wait states for a frequency and supply, the
 // DFLL48M closed-loop multiplier, and the compile-time messages that print the numbers when one of
 // them does not fit. Every datasheet number comes from the chip's ClockLimits.hpp; this file knows
-// none. Standard headers and Kvasir/Util/Prescaler.hpp only: host-tested in tests/.
+// none. Standard headers, Kvasir/Util/Prescaler.hpp and Kvasir/Util/Diagnostic.hpp only: host-tested in tests/.
+// The messages are generators asserted through KVASIR_STATIC_ASSERT: built only when the assert fails.
 //
 //     constexpr auto dpll = Kvasir::DPLL::fromXosc<Limits::Fdpll96m>(8'000'000, 48'000'000);
 //     // {div 3, ldr 47, ldrFrac 0, presc 0, gclkDiv 1}: 8 MHz / (2 x 4) = 1 MHz x 48 = 48 MHz
@@ -12,6 +13,7 @@
 //
 // The chip packages wrap these in templates that assert (chip/ClockLimits.hpp, chip/Dpll.hpp).
 
+#include "kvasir/Util/Diagnostic.hpp"
 #include "kvasir/Util/Prescaler.hpp"
 
 #include <array>
@@ -86,7 +88,7 @@ namespace DPLL {
         Prescaler::Rational dco{};        // the DCO output
         bool                found{};
 
-        constexpr bool integerMode() const { return ldrFrac == 0; }
+        [[nodiscard]] constexpr bool integerMode() const { return ldrFrac == 0; }
     };
 
     namespace detail {
@@ -218,7 +220,7 @@ namespace DPLL {
     }
 
     // A setting written by hand, measured against the limits: what it makes and where it breaks
-    // them. For a firmware that keeps its own numbers (smart_hive) and the messages below.
+    // them. For a firmware that keeps its own numbers, and the messages below.
     struct Check {
         Prescaler::Rational ref{};
         Prescaler::Rational dco{};
@@ -227,7 +229,7 @@ namespace DPLL {
         bool                dcoInRange{};
         bool                fieldsFit{};
 
-        constexpr bool ok() const { return refInRange && dcoInRange && fieldsFit; }
+        [[nodiscard]] constexpr bool ok() const { return refInRange && dcoInRange && fieldsFit; }
     };
 
     template<ClockLimits::Dpll L>
@@ -257,7 +259,7 @@ namespace DPLL {
 }   // namespace DPLL
 
 namespace Nvm {
-    inline constexpr unsigned NoWaitStateCount = 0xFF;
+    inline constexpr unsigned noWaitStateCount = 0xFF;
 
     // The fewest wait states that allow hz at this supply; NoWaitStateCount when the table has
     // none (a static_assert at the caller).
@@ -270,41 +272,41 @@ namespace Nvm {
                 if(hz <= row.maxHz[ws]) { return ws; }
             }
         }
-        return NoWaitStateCount;
+        return noWaitStateCount;
     }
 
     // "flash wait states: 48000000 Hz at 1.62-2.7 V needs 3 (Table 37-42 ...), RWS is 1", or
     // "... has no wait-state count for 49000000 Hz at 2.7 V and above (Table 37-42 ...)"
     template<std::uint64_t Hz, ClockLimits::Supply S, unsigned Rws, auto const& Table>
-    struct WaitStateMessage {
-        static constexpr Prescaler::detail::Writer storage = [] {
-            Prescaler::detail::Writer w{};
-            auto const                need = waitStates(Table, S, Hz);
-            w.text("flash wait states: ");
-            if(need == NoWaitStateCount) {
-                w.text("no count for ").integer(Hz).text(" Hz at ").text(supplyName(S));
-                w.text(" in ").text(Table.name);
+    struct WaitStateText {
+        consteval Diagnostic::Text operator()() const {
+            Diagnostic::Text t;
+            auto const       need = waitStates(Table, S, Hz);
+            t << "flash wait states: ";
+            if(need == noWaitStateCount) {
+                t << "no count for ";
+                t.dec(Hz) << " Hz at " << supplyName(S) << " in " << Table.name;
             } else {
-                w.integer(Hz).text(" Hz at ").text(supplyName(S)).text(" needs ").integer(need);
-                w.text(" (").text(Table.name).text("), RWS is ").integer(Rws);
+                t.dec(Hz) << " Hz at " << supplyName(S) << " needs ";
+                t.dec(need) << " (" << Table.name << "), RWS is ";
+                t.dec(Rws);
             }
-            return w;
-        }();
-
-        constexpr std::size_t size() const { return storage.n; }
-
-        constexpr char const* data() const { return storage.out.data(); }
-
-        constexpr std::string_view view() const { return {data(), size()}; }
+            return t;
+        }
     };
+
+    // the same text as an object with size() / data() / view() (golden tests)
+    template<std::uint64_t Hz, ClockLimits::Supply S, unsigned Rws, auto const& Table>
+    using WaitStateMessage = Diagnostic::Message<WaitStateText<Hz, S, Rws, Table>>;
 
     // the count from the table, asserted to exist
     template<std::uint64_t       Hz,
              ClockLimits::Supply S,
              auto const&         Table>
     consteval unsigned waitStatesFrom() {
-        constexpr unsigned ws = waitStates(Table, S, Hz);
-        static_assert(ws != NoWaitStateCount, WaitStateMessage<Hz, S, 0, Table>{});
+        constexpr unsigned ws    = waitStates(Table, S, Hz);
+        constexpr bool     found = ws != noWaitStateCount;
+        KVASIR_STATIC_ASSERT(found, (WaitStateText<Hz, S, 0, Table>));
         return ws;
     }
 
@@ -314,8 +316,9 @@ namespace Nvm {
              unsigned            Rws,
              auto const&         Table>
     consteval void assertWaitStatesFrom() {
-        constexpr unsigned ws = waitStates(Table, S, Hz);
-        static_assert(ws != NoWaitStateCount && Rws >= ws, WaitStateMessage<Hz, S, Rws, Table>{});
+        constexpr unsigned ws     = waitStates(Table, S, Hz);
+        constexpr bool     enough = ws != noWaitStateCount && Rws >= ws;
+        KVASIR_STATIC_ASSERT(enough, (WaitStateText<Hz, S, Rws, Table>));
     }
 }   // namespace Nvm
 
@@ -345,88 +348,97 @@ namespace DFLL {
     // DFLLVAL.FINE" (SAM D21 DS40001882L 17.6.7.1.2 step 2, md line 7253; E5x DS60001507N
     // 28.6.4.1 "Closed-Loop Operation" step 2, md line 31813)
     template<ClockLimits::Dfll L>
-    inline constexpr std::uint32_t MaxCoarseStep = ((std::uint32_t{1} << L.coarseBits) - 1) / 2;
+    inline constexpr std::uint32_t maxCoarseStep = ((std::uint32_t{1} << L.coarseBits) - 1) / 2;
     template<ClockLimits::Dfll L>
-    inline constexpr std::uint32_t MaxFineStep = ((std::uint32_t{1} << L.fineBits) - 1) / 2;
+    inline constexpr std::uint32_t maxFineStep = ((std::uint32_t{1} << L.fineBits) - 1) / 2;
 }   // namespace DFLL
 
 namespace ClockLimits {
     // "<what>: wanted <lo>..<hi> Hz, got <x> Hz (<context>)" for a frequency out of a table range
-    template<Prescaler::Rational    Got,
-             std::uint64_t          Lo,
-             std::uint64_t          Hi,
-             Prescaler::FixedString What,
-             Prescaler::FixedString Where>
-    struct RangeMessage {
-        static constexpr Prescaler::detail::Writer storage = [] {
-            Prescaler::detail::Writer w{};
-            w.text(What.view()).text(": wanted ").integer(Lo).text("..").integer(Hi);
-            w.text(" Hz, got ").fixed1(Got).text(" Hz (").text(Where.view()).text(")");
-            return w;
-        }();
-
-        constexpr std::size_t size() const { return storage.n; }
-
-        constexpr char const* data() const { return storage.out.data(); }
-
-        constexpr std::string_view view() const { return {data(), size()}; }
+    template<Prescaler::Rational     Got,
+             std::uint64_t           Lo,
+             std::uint64_t           Hi,
+             Diagnostic::FixedString What,
+             Diagnostic::FixedString Where>
+    struct RangeText {
+        consteval Diagnostic::Text operator()() const {
+            Diagnostic::Text t;
+            t << What.view() << ": wanted ";
+            t.dec(Lo) << "..";
+            t.dec(Hi) << " Hz, got ";
+            t.fixed1(Got.num, Got.den) << " Hz (" << Where.view() << ")";
+            return t;
+        }
     };
 
-    template<Prescaler::Rational    Got,
-             std::uint64_t          Lo,
-             std::uint64_t          Hi,
-             Prescaler::FixedString What,
-             Prescaler::FixedString Where>
+    // the same text as an object with size() / data() / view() (golden tests)
+    template<Prescaler::Rational     Got,
+             std::uint64_t           Lo,
+             std::uint64_t           Hi,
+             Diagnostic::FixedString What,
+             Diagnostic::FixedString Where>
+    using RangeMessage = Diagnostic::Message<RangeText<Got, Lo, Hi, What, Where>>;
+
+    template<Prescaler::Rational     Got,
+             std::uint64_t           Lo,
+             std::uint64_t           Hi,
+             Diagnostic::FixedString What,
+             Diagnostic::FixedString Where>
     consteval void assertInRange() {
-        static_assert(!Prescaler::below(Got, Lo) && !Prescaler::above(Got, Hi),
-                      RangeMessage<Got, Lo, Hi, What, Where>{});
+        constexpr bool inRange = !Prescaler::below(Got, Lo) && !Prescaler::above(Got, Hi);
+        KVASIR_STATIC_ASSERT(inRange, (RangeText<Got, Lo, Hi, What, Where>));
     }
 }   // namespace ClockLimits
 
 namespace DPLL {
     // "<Where>: no setting makes 48000000 Hz from 8000000 Hz (integer mode, 0 ppm)"
-    template<Prescaler::FixedString Where,
-             std::uint64_t          In,
-             std::uint64_t          Want,
-             std::uint64_t          TolerancePpm,
-             bool                   Fractional>
-    struct NotFoundMessage {
-        static constexpr Prescaler::detail::Writer storage = [] {
-            Prescaler::detail::Writer w{};
-            w.text(Where.view()).text(": no setting makes ").integer(Want).text(" Hz from ");
-            w.integer(In).text(" Hz (").text(Fractional ? "fractional allowed" : "integer mode");
-            w.text(", ").integer(TolerancePpm).text(" ppm)");
-            return w;
-        }();
-
-        constexpr std::size_t size() const { return storage.n; }
-
-        constexpr char const* data() const { return storage.out.data(); }
-
-        constexpr std::string_view view() const { return {data(), size()}; }
+    template<Diagnostic::FixedString Where,
+             std::uint64_t           In,
+             std::uint64_t           Want,
+             std::uint64_t           TolerancePpm,
+             bool                    Fractional>
+    struct NotFoundText {
+        consteval Diagnostic::Text operator()() const {
+            Diagnostic::Text t;
+            t << Where.view() << ": no setting makes ";
+            t.dec(Want) << " Hz from ";
+            t.dec(In) << " Hz (" << (Fractional ? "fractional allowed" : "integer mode") << ", ";
+            t.dec(TolerancePpm) << " ppm)";
+            return t;
+        }
     };
 
+    // the same text as an object with size() / data() / view() (golden tests)
+    template<Diagnostic::FixedString Where,
+             std::uint64_t           In,
+             std::uint64_t           Want,
+             std::uint64_t           TolerancePpm,
+             bool                    Fractional>
+    using NotFoundMessage
+      = Diagnostic::Message<NotFoundText<Where, In, Want, TolerancePpm, Fractional>>;
+
     // the solver, asserted: a crystal through DIV
-    template<ClockLimits::Dpll      L,
-             Prescaler::FixedString Where,
-             std::uint64_t          XoscHz,
-             std::uint64_t          Hz,
-             std::uint64_t          TolerancePpm,
-             bool                   Fractional>
+    template<ClockLimits::Dpll       L,
+             Diagnostic::FixedString Where,
+             std::uint64_t           XoscHz,
+             std::uint64_t           Hz,
+             std::uint64_t           TolerancePpm,
+             bool                    Fractional>
     consteval Setting solveXosc() {
         constexpr auto s
           = fromXosc<L>(XoscHz, Hz, Prescaler::Tolerance::ppm(TolerancePpm), Fractional);
-        static_assert(s.found, NotFoundMessage<Where, XoscHz, Hz, TolerancePpm, Fractional>{});
+        constexpr bool found = s.found;
+        KVASIR_STATIC_ASSERT(found, (NotFoundText<Where, XoscHz, Hz, TolerancePpm, Fractional>));
         return s;
     }
 
     // ... a reference taken directly, which must be inside f_IN itself
-    template<ClockLimits::Dpll      L,
-             Prescaler::FixedString Where,
-             std::uint64_t          RefHz,
-             std::uint64_t          Hz,
-             std::uint64_t          TolerancePpm,
-             bool                   Fractional>
+    template<ClockLimits::Dpll       L,
+             Diagnostic::FixedString Where,
+             std::uint64_t           RefHz,
+             std::uint64_t           Hz,
+             std::uint64_t           TolerancePpm,
+             bool                    Fractional>
     consteval Setting solveReference() {
         ClockLimits::assertInRange<Prescaler::Rational{RefHz, 1},
                                    L.refMin,
@@ -435,20 +447,21 @@ namespace DPLL {
                                    Where>();
         constexpr auto s
           = fromReference<L>(RefHz, Hz, Prescaler::Tolerance::ppm(TolerancePpm), Fractional);
-        static_assert(s.found, NotFoundMessage<Where, RefHz, Hz, TolerancePpm, Fractional>{});
+        constexpr bool found = s.found;
+        KVASIR_STATIC_ASSERT(found, (NotFoundText<Where, RefHz, Hz, TolerancePpm, Fractional>));
         return s;
     }
 
     // A setting written by hand, asserted against the limits:
     // "FDPLL reference: wanted 32000..2000000 Hz, got 31007.8 Hz (SAM D21 Tables 37-58/59/60)"
-    template<ClockLimits::Dpll      L,
-             Prescaler::FixedString Where,
-             std::uint64_t          XoscHz,
-             std::uint32_t          Div,
-             std::uint32_t          Ldr,
-             std::uint32_t          LdrFrac,
-             std::uint32_t          Presc   = 0,
-             std::uint32_t          GclkDiv = 1>
+    template<ClockLimits::Dpll       L,
+             Diagnostic::FixedString Where,
+             std::uint64_t           XoscHz,
+             std::uint32_t           Div,
+             std::uint32_t           Ldr,
+             std::uint32_t           LdrFrac,
+             std::uint32_t           Presc   = 0,
+             std::uint32_t           GclkDiv = 1>
     consteval Check assertXoscSetting() {
         constexpr auto c = checkXosc<L>(XoscHz, Div, Ldr, LdrFrac, Presc, GclkDiv);
         static_assert(c.fieldsFit, "FDPLL: DIV, LDR, LDRFRAC or PRESC wider than its field");

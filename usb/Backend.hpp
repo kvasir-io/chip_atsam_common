@@ -14,39 +14,45 @@
 // THE CLOCK IS THE APPLICATION'S: GCLK_USB has to be 48 MHz +-0.25 % (SAM D21 datasheet
 // DS40001882, 32.5.3), which on a board without a crystal means the DFLL48M in USB clock recovery
 // mode (chip/DFLL.hpp, enableUsbRecovery()), and the clock settings have to route a generator to
-// Traits::gclkChannel - and say so: `using Provides = brigand::list<Kvasir::Clocks::Clk<
+// Traits::gclkChannel - and say so: `using Provides = brigand::list<Kvasir::Hal::Clk<
 // Kvasir::Clocks::ClkUsb, 48'000'000>>;` (../Clocks.hpp), or Startup refuses the USB. Without that
 // clock the module never finishes its reset; prepare() gives up after a while and logs it.
 //
 // How this controller differs from the RP one, all of it within the contract:
-//   - An endpoint has one transfer with the controller at a time (QueueDepth 1), in ordinary RAM
+//   - An endpoint has one transfer with the controller at a time (queueDepth 1), in ordinary RAM
 //     which the module reads and writes by itself (32.6.2.2): a packet in a buffer of this
 //     driver's, or - bulk IN - up to MaxTransfer bytes where the caller keeps them, which the
 //     module splits into packets itself (32.6.2.10), with one interrupt at the end.
 //   - The data toggle is the hardware's (EPSTATUS.DTGLIN / DTGLOUT).
-//   - Taking a packet back is done on return (AsyncCancel = false).
+//   - Taking a packet back is done on return (asyncCancel = false).
 //   - A bus reset disables every endpoint but 0 and every endpoint interrupt (32.6.2.4): the
 //     device sets every endpoint up again on a bus reset, which is what puts them back.
 //
 // Besides what the device reads, the config struct may carry
 //
 //     isrPriority      1
-//     UsbMaxTransfer   512: how much one arm of a bulk IN endpoint carries (a multiple of 64; 64
+//     usbMaxTransfer   512: how much one arm of a bulk IN endpoint carries (a multiple of 64; 64
 //                      turns the multi-packet transfers off). The bulk endpoint's staging buffer
 //                      is this large.
-//     UsbMaxReceive    512: the same for a bulk OUT endpoint, which the module fills by itself
+//     usbMaxReceive    512: the same for a bulk OUT endpoint, which the module fills by itself
 //                      (32.6.2.8); 64 turns it off.
 //
 // Run on hardware (ATSAMD21G18A).
 
 #include "../Clocks.hpp"
 #include "chip/Usb_Traits.hpp"
+#include "chip/WaitBounds.hpp"
+#include "kvasir/Hal/DmaHandoff.hpp"
+#include "kvasir/Hal/Owns.hpp"
+#include "kvasir/Util/Config.hpp"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <kvasir/Devices/Log.hpp>
 #include <kvasir/Devices/USB/Backend.hpp>
 #include <kvasir/Devices/USB/Config.hpp>
@@ -56,9 +62,6 @@
 #include <string_view>
 
 namespace Kvasir::USB::Sam {
-// Startup resource: the one USB controller (kvasir/StartUp/Resources.hpp).
-struct InstanceTag {};
-
 namespace detail {
     // One bank of an endpoint descriptor, as the module reads it out of RAM (32.13 "Endpoint
     // Descriptor Structure", 32.14 register summary): ADDR at 0x00, PCKSIZE at 0x04, EXTREG at
@@ -82,21 +85,18 @@ namespace detail {
 
     // PCKSIZE (32.15.2): BYTE_COUNT is bits 13:0, MULTI_PACKET_SIZE 27:14, SIZE 30:28 (3 = 64
     // bytes), AUTO_ZLP bit 31.
-    inline constexpr std::uint32_t ByteCountMask  = 0x3FFFU;
-    inline constexpr unsigned      MultiPacketPos = 14;
-    inline constexpr std::uint32_t Size64         = 3U << 28U;
+    inline constexpr std::uint32_t byteCountMask  = 0x3FFFU;
+    inline constexpr unsigned      multiPacketPos = 14;
+    inline constexpr std::uint32_t size64         = 3U << 28U;
 
-    // The module writes it (BYTE_COUNT, STATUS_BK) behind the compiler's back. One table: there
-    // is one controller, whatever Clock and Config the backend is instantiated with.
-    alignas(4) inline EndpointDescriptor volatile descriptorTable[Traits::EndpointCount]{};
-
-    // An endpoint buffer the module wrote, read without the compiler assuming it knows what is
-    // in there.
-    inline void copyFromModule(std::span<std::byte> dest,
-                               std::byte const*     src) {
-        auto const* const in = static_cast<std::byte const volatile*>(src);
-        for(std::size_t i = 0; i != dest.size(); ++i) { dest[i] = in[i]; }
-    }
+    // Plain memory the module reads and writes (BYTE_COUNT, MULTI_PACKET_SIZE, STATUS_BK) while an
+    // endpoint is armed, as it does the endpoint buffers: each bank and buffer is the core's until
+    // the register write that arms it (Hal::handToHardware() before it) and again once its
+    // TRCPT/RXSTP flag is seen (Hal::takeFromHardware() in dispatchEndpoint, before the device
+    // hears of it; Kvasir/Hal/DmaHandoff.hpp). A count read while the module may still move it is
+    // a Hal::loadHardwareField(). One table: there is one controller, whatever Clock and Config the
+    // backend is instantiated with.
+    alignas(4) inline EndpointDescriptor descriptorTable[Traits::endpointCount]{};
 }   // namespace detail
 
 template<typename Clock, typename ConfigT>
@@ -105,54 +105,36 @@ private:
     using Regs      = typename Traits::Regs;
     using CfgTraits = Kvasir::USB::ConfigTraits<ConfigT>;
 
-    static constexpr auto isrPriority = [] {
-        if constexpr(requires { ConfigT::isrPriority; }) {
-            return ConfigT::isrPriority;
-        } else {
-            return 1;
-        }
-    }();
+    static constexpr auto isrPriority = KVASIR_CONFIG_OR(ConfigT, isrPriority, 1);
 
     // SYNCBUSY clears once GCLK_USB has carried the write across (32.5.3: the generic clock is
-    // asynchronous to the bus clock). With no GCLK_USB it never does, so the wait is bounded: a
-    // synchronisation takes a few clock cycles, this is tens of milliseconds.
+    // asynchronous to the bus clock). With no GCLK_USB it never does, so the wait is bounded
+    // (Sam::UsbSyncBound, whatever policy the application injects: prepare() reports it).
     static bool waitSync() {
-        for(std::uint32_t i = 0; i != 1'000'000U; ++i) {
-            std::uint8_t const busy = apply(read(Regs::SYNCBUSY::FULLREGISTER));
-            if(busy == 0) { return true; }
-        }
-        return false;
+        return static_cast<bool>(Kvasir::Register::waitUntil<Kvasir::Chip::Sam::UsbSyncBound,
+                                                             Kvasir::Register::OnTimeout::Report>(
+          Kvasir::Register::isClear(Regs::SYNCBUSY::FULLREGISTER)));
     }
 
     static inline bool clockMissing{false};
 
 public:
-    static constexpr std::size_t MaxPacketSize = 64;
-    static constexpr std::size_t EndpointCount = Traits::EndpointCount;
+    static constexpr std::size_t maxPacketSize = 64;
+    static constexpr std::size_t endpointCount = Traits::endpointCount;
 
-    static constexpr std::size_t ConfiguredMaxTransfer = [] {
-        if constexpr(requires { ConfigT::UsbMaxTransfer; }) {
-            return static_cast<std::size_t>(ConfigT::UsbMaxTransfer);
-        } else {
-            return std::size_t{512};
-        }
-    }();
+    static constexpr std::size_t configuredMaxTransfer
+      = static_cast<std::size_t>(KVASIR_CONFIG_OR(ConfigT, usbMaxTransfer, std::size_t{512}));
     // BYTE_COUNT and MULTI_PACKET_SIZE are 14 bits (32.15.2).
-    static_assert(ConfiguredMaxTransfer % MaxPacketSize == 0 && ConfiguredMaxTransfer != 0
-                    && ConfiguredMaxTransfer < (1U << 14U),
-                  "UsbMaxTransfer: a multiple of 64 below 16384");
-    static constexpr bool AsyncCancel = false;
+    static_assert(configuredMaxTransfer % maxPacketSize == 0 && configuredMaxTransfer != 0
+                    && configuredMaxTransfer < (1U << 14U),
+                  "usbMaxTransfer: a multiple of 64 below 16384");
+    static constexpr bool asyncCancel = false;
 
-    static constexpr std::size_t ConfiguredMaxReceive = [] {
-        if constexpr(requires { ConfigT::UsbMaxReceive; }) {
-            return static_cast<std::size_t>(ConfigT::UsbMaxReceive);
-        } else {
-            return std::size_t{512};
-        }
-    }();
-    static_assert(ConfiguredMaxReceive % MaxPacketSize == 0 && ConfiguredMaxReceive != 0
-                    && ConfiguredMaxReceive < (1U << 14U),
-                  "UsbMaxReceive: a multiple of 64 below 16384");
+    static constexpr std::size_t configuredMaxReceive
+      = static_cast<std::size_t>(KVASIR_CONFIG_OR(ConfigT, usbMaxReceive, std::size_t{512}));
+    static_assert(configuredMaxReceive % maxPacketSize == 0 && configuredMaxReceive != 0
+                    && configuredMaxReceive < (1U << 14U),
+                  "usbMaxReceive: a multiple of 64 below 16384");
 
     template<std::size_t N, EndpointDirection Dir, EndpointTransferType Type>
     struct Endpoint {
@@ -161,19 +143,19 @@ public:
 
         using E = typename Traits::template Endpoint<N>;
 
-        static constexpr bool     IsIn = Dir == EndpointDirection::In;
-        static constexpr unsigned Bank = IsIn ? 1 : 0;
+        static constexpr bool     isIn = Dir == EndpointDirection::In;
+        static constexpr unsigned bank = isIn ? 1 : 0;
 
-        static_assert(N < Traits::EndpointCount,
+        static_assert(N < Traits::endpointCount,
                       "the controller has no such endpoint");
 
         // The packet, where the module reads or writes it: "Endpoint data can be placed anywhere
         // in the device RAM" (32.6.2.2). Word aligned, because the module is a bus master of its
         // own. A SETUP packet arrives in endpoint 0's OUT buffer.
         alignas(4) static inline std::array<std::byte,
-                                            MaxPacketSize> buffer{};
+                                            maxPacketSize> buffer{};
 
-        static auto& bank() { return detail::descriptorTable[N].bank[Bank]; }
+        static auto& bankDescriptor() { return detail::descriptorTable[N].bank[bank]; }
 
         static inline std::size_t sentOfCancelled_{};
 
@@ -181,7 +163,7 @@ public:
         // STALLRQ0 / TRCPT0 for OUT. EPSTATUSSET / EPSTATUSCLR are strobes (a '1' sets or clears
         // that bit, a '0' does nothing): write-only registers, so a set() of them is one store.
         template<typename InField, typename OutField>
-        using PerDir = std::remove_cvref_t<std::conditional_t<IsIn, InField, OutField>>;
+        using PerDir = std::remove_cvref_t<std::conditional_t<isIn, InField, OutField>>;
 
         using Ready    = PerDir<decltype(E::EPSTATUS::bk1rdy), decltype(E::EPSTATUS::bk0rdy)>;
         using ReadySet = PerDir<decltype(E::EPSTATUSSET::bk1rdy), decltype(E::EPSTATUSSET::bk0rdy)>;
@@ -202,41 +184,42 @@ public:
         // IN endpoint is with the controller while BK1RDY is set, an OUT one while BK0RDY is clear.
         static bool withController() {
             bool const ready = apply(read(Ready{})) != 0;
-            return IsIn ? ready : !ready;
+            return isIn ? ready : !ready;
         }
 
         static bool completionPending() { return apply(read(Complete{})) != 0; }
 
         // EPCFG.EPTYPEn (32.12.1): 1 control, 2 isochronous, 3 bulk, 4 interrupt - one more than
         // the transfer type's code in a descriptor.
-        static constexpr unsigned EpType = static_cast<unsigned>(Type) + 1;
+        static constexpr unsigned epType = static_cast<unsigned>(Type) + 1;
 
         static void configure() {
-            auto& b = bank();
+            auto& b = bankDescriptor();
             // Where the data is, is said when an endpoint is armed - but a SETUP comes unasked,
             // so endpoint 0's OUT bank always points at its buffer.
-            if constexpr(Type == EndpointTransferType::Control && !IsIn) {
+            if constexpr(Type == EndpointTransferType::Control && !isIn) {
                 b.addr = reinterpret_cast<std::uint32_t>(buffer.data());
             } else {
                 b.addr = 0;
             }
-            b.pcksize  = detail::Size64;
+            b.pcksize  = detail::size64;
             b.extreg   = 0;
             b.statusBk = 0;
+            Kvasir::Hal::handToHardware();
 
             // nothing to send, nothing wanted, DATA0 next, not stalled
-            if constexpr(IsIn) {
+            if constexpr(isIn) {
                 apply(set(ReadyClear{}, ToggleClear{}, StallClear{}));
-                apply(write(E::EPCFG::eptype1, EpType));
+                apply(write(E::EPCFG::eptype1, epType));
             } else {
                 apply(set(ReadySet{}));
                 apply(set(ToggleClear{}, StallClear{}));
-                apply(write(E::EPCFG::eptype0, EpType));
+                apply(write(E::EPCFG::eptype0, epType));
             }
             // The flag is a strobe too (write '1' to clear); then the interrupt. Transfer
             // failures (every NAK is one) and sent STALLs stay off.
             apply(Kvasir::Register::reset(Complete{}));
-            if constexpr(Type == EndpointTransferType::Control && !IsIn) {
+            if constexpr(Type == EndpointTransferType::Control && !isIn) {
                 apply(set(CompleteEnable{}, E::EPINTENSET::rxstp));
             } else {
                 apply(set(CompleteEnable{}));
@@ -244,8 +227,8 @@ public:
         }
 
     public:
-        static constexpr std::size_t QueueDepth  = 1;
-        static constexpr bool        AsyncCancel = false;
+        static constexpr std::size_t queueDepth  = 1;
+        static constexpr bool        asyncCancel = false;
 
         using FreeBuffers = std::array<bool, 1>;
 
@@ -254,7 +237,7 @@ public:
         // and cancel() would take it for "the new one went out". OUT checks the same in
         // armReceive().
         static FreeBuffers freeBuffers() {
-            if constexpr(IsIn) {
+            if constexpr(isIn) {
                 return {!withController() && !completionPending()};
             } else {
                 return {!withController()};
@@ -275,19 +258,20 @@ public:
         template<bool Last>
         static bool tryTransfer(std::span<std::byte const> data,
                                 FreeBuffers const&         free) {
-            static_assert(IsIn, "tryTransfer is the IN side");
-            if(!free[0] || data.size() > MaxPacketSize) { return false; }
-            std::copy(data.begin(), data.end(), buffer.begin());
-            bank().addr    = reinterpret_cast<std::uint32_t>(buffer.data());
-            bank().pcksize = detail::Size64 | static_cast<std::uint32_t>(data.size());
+            static_assert(isIn, "tryTransfer is the IN side");
+            if(!free[0] || data.size() > maxPacketSize) { return false; }
+            std::ranges::copy(data, buffer.begin());
+            bankDescriptor().addr    = reinterpret_cast<std::uint32_t>(buffer.data());
+            bankDescriptor().pcksize = detail::size64 | static_cast<std::uint32_t>(data.size());
+            Kvasir::Hal::handToHardware();
             apply(set(ReadySet{}));
             return true;
         }
 
         // How much one arm carries: bulk IN only. Control transfers stay at a packet (the device
         // runs their stages packet by packet), interrupt ones are a packet by nature.
-        static constexpr std::size_t MaxTransfer
-          = IsIn && Type == EndpointTransferType::Bulk ? ConfiguredMaxTransfer : MaxPacketSize;
+        static constexpr std::size_t maxTransfer
+          = isIn && Type == EndpointTransferType::Bulk ? configuredMaxTransfer : maxPacketSize;
 
         // A whole transfer, read by the module where it is: BYTE_COUNT is its length and
         // MULTI_PACKET_SIZE, the module's count of what has gone out, starts at zero; it sends
@@ -296,22 +280,23 @@ public:
         template<bool Last>
         static bool tryTransferInPlace(std::span<std::byte const> data,
                                        FreeBuffers const&         free)
-            requires(IsIn && Type == EndpointTransferType::Bulk)
+            requires(isIn && Type == EndpointTransferType::Bulk)
         {
-            if(!free[0] || data.size() > MaxTransfer
+            if(!free[0] || data.size() > maxTransfer
                || reinterpret_cast<std::uintptr_t>(data.data()) % 4 != 0)
             {
                 return false;
             }
-            bank().addr    = reinterpret_cast<std::uint32_t>(data.data());
-            bank().pcksize = detail::Size64 | static_cast<std::uint32_t>(data.size());
+            bankDescriptor().addr    = reinterpret_cast<std::uint32_t>(data.data());
+            bankDescriptor().pcksize = detail::size64 | static_cast<std::uint32_t>(data.size());
+            Kvasir::Hal::handToHardware();
             apply(set(ReadySet{}));
             return true;
         }
 
         // Of the transfer cancel() took back: what MULTI_PACKET_SIZE said had gone out.
         static std::size_t sentOfCancelled()
-            requires(IsIn && Type == EndpointTransferType::Bulk)
+            requires(isIn && Type == EndpointTransferType::Bulk)
         {
             return sentOfCancelled_;
         }
@@ -321,11 +306,13 @@ public:
         // zero (32.6.2.8). A packet that came and was not yet reported still owns the buffer.
         template<bool Last = false>
         static bool armReceive(std::size_t) {
-            static_assert(!IsIn, "armReceive is the OUT side");
+            static_assert(!isIn, "armReceive is the OUT side");
             if(withController() || completionPending()) { return false; }
-            bank().addr    = reinterpret_cast<std::uint32_t>(buffer.data());
-            bank().pcksize = detail::Size64
-                           | (static_cast<std::uint32_t>(MaxPacketSize) << detail::MultiPacketPos);
+            bankDescriptor().addr = reinterpret_cast<std::uint32_t>(buffer.data());
+            bankDescriptor().pcksize
+              = detail::size64
+              | (static_cast<std::uint32_t>(maxPacketSize) << detail::multiPacketPos);
+            Kvasir::Hal::handToHardware();
             apply(set(ReadyClear{}));
             return true;
         }
@@ -338,35 +325,40 @@ public:
         // silicon: full packets are acknowledged and only add to BYTE_COUNT, without
         // TRCPT0; a short packet ends the transfer with one; and behind a short packet's payload
         // the module writes its CRC, up to two bytes, still inside that packet's 64 (32.6.2.7).
-        static constexpr std::size_t MaxReceive
-          = !IsIn && Type == EndpointTransferType::Bulk ? ConfiguredMaxReceive : MaxPacketSize;
+        static constexpr std::size_t maxReceive
+          = !isIn && Type == EndpointTransferType::Bulk ? configuredMaxReceive : maxPacketSize;
 
         static bool armReceiveInto(std::span<std::byte> dest)
-            requires(!IsIn && Type == EndpointTransferType::Bulk)
+            requires(!isIn && Type == EndpointTransferType::Bulk)
         {
-            if(withController() || completionPending() || dest.empty() || dest.size() > MaxReceive
-               || dest.size() % MaxPacketSize != 0
+            if(withController() || completionPending() || dest.empty() || dest.size() > maxReceive
+               || dest.size() % maxPacketSize != 0
                || reinterpret_cast<std::uintptr_t>(dest.data()) % 4 != 0)
             {
                 return false;
             }
-            bank().addr    = reinterpret_cast<std::uint32_t>(dest.data());
-            bank().pcksize = detail::Size64
-                           | (static_cast<std::uint32_t>(dest.size()) << detail::MultiPacketPos);
+            bankDescriptor().addr = reinterpret_cast<std::uint32_t>(dest.data());
+            bankDescriptor().pcksize
+              = detail::size64
+              | (static_cast<std::uint32_t>(dest.size()) << detail::multiPacketPos);
+            Kvasir::Hal::handToHardware();
             apply(set(ReadyClear{}));
             return true;
         }
 
+        // in transferComplete (after its takeFromHardware), or polled by takeBackReceive(): one
+        // load of the module's count each call
         static std::size_t received()
-            requires(!IsIn && Type == EndpointTransferType::Bulk)
+            requires(!isIn && Type == EndpointTransferType::Bulk)
         {
-            return bank().pcksize & detail::ByteCountMask;
+            return Kvasir::Hal::loadHardwareField(bankDescriptor().pcksize) & detail::byteCountMask;
         }
 
+        // while armed: the module moves it under the caller
         static std::size_t receivedSoFar()
-            requires(!IsIn && Type == EndpointTransferType::Bulk)
+            requires(!isIn && Type == EndpointTransferType::Bulk)
         {
-            return bank().pcksize & detail::ByteCountMask;
+            return Kvasir::Hal::loadHardwareField(bankDescriptor().pcksize) & detail::byteCountMask;
         }
 
         // Ends the transfer: BK0RDY set makes the module NAK from the next token on. A packet
@@ -377,27 +369,30 @@ public:
         // The cost: the caller holds the USB interrupt (or is in it, for a SET_FEATURE halt) for
         // those 120 us - two packets' time, once per taken-back transfer, not per packet.
         static std::optional<std::size_t> takeBackReceive()
-            requires(!IsIn && Type == EndpointTransferType::Bulk)
+            requires(!isIn && Type == EndpointTransferType::Bulk)
         {
-            static constexpr auto Settle = std::chrono::microseconds{120};
+            static constexpr auto settle = std::chrono::microseconds{120};
             apply(set(ReadySet{}));
             std::size_t count = received();
             auto        since = Clock::now();
-            while(Clock::now() - since < Settle) {
+            while(Clock::now() - since < settle) {
                 if(std::size_t const now = received(); now != count) {
                     count = now;
                     since = Clock::now();
                 }
             }
             if(completionPending()) { return std::nullopt; }
+            // BK0RDY stops the module: what it wrote into the caller's memory is the core's again
+            Kvasir::Hal::takeFromHardware();
             return count;
         }
 
         static std::size_t readCurrentBuffer(std::span<std::byte> dest) {
-            static_assert(!IsIn, "read only on an OUT endpoint");
-            std::size_t const received = bank().pcksize & detail::ByteCountMask;
+            static_assert(!isIn, "read only on an OUT endpoint");
+            // in transferComplete: dispatchEndpoint took the bank and the buffer back first
+            std::size_t const received = bankDescriptor().pcksize & detail::byteCountMask;
             std::size_t const n        = std::min(received, dest.size());
-            detail::copyFromModule(dest.first(n), buffer.data());
+            std::memcpy(dest.data(), buffer.data(), n);
             return n;
         }
 
@@ -413,16 +408,19 @@ public:
         // completion is flagged it has, and that report is dropped with it. OUT: a packet that
         // already came stays reported (it was acknowledged), only the wait for one ends.
         static std::size_t cancel() {
-            if constexpr(IsIn) {
+            if constexpr(isIn) {
                 bool const armed = withController();
                 apply(set(ReadyClear{}));
                 bool const sent = completionPending();
                 apply(Kvasir::Register::reset(Complete{}));
+                // BK1RDY clear: the bank is the core's again
+                Kvasir::Hal::takeFromHardware();
                 // A transfer of several packets may have gone out in part: the module counts
                 // what it sent in MULTI_PACKET_SIZE, a packet at a time (32.6.2.10).
-                sentOfCancelled_ = armed && !sent ? (bank().pcksize >> detail::MultiPacketPos)
-                                                      & detail::ByteCountMask
-                                                  : 0;
+                sentOfCancelled_
+                  = armed && !sent
+                    ? (bankDescriptor().pcksize >> detail::multiPacketPos) & detail::byteCountMask
+                    : 0;
                 return armed && !sent ? 1 : 0;
             } else {
                 apply(set(ReadySet{}));
@@ -432,7 +430,7 @@ public:
     };
 
 private:
-    using EP0_OUT = Endpoint<0, EndpointDirection::Out, EndpointTransferType::Control>;
+    using Ep0Out = Endpoint<0, EndpointDirection::Out, EndpointTransferType::Control>;
 
     template<std::size_t N,
              typename Sink>
@@ -441,6 +439,9 @@ private:
         // one read of EPINTFLAG
         auto const flags
           = apply(read(E::EPINTFLAG::trcpt1, E::EPINTFLAG::trcpt0, E::EPINTFLAG::rxstp));
+        // what completed - its bank, its buffer, a caller's memory the module wrote - is the core's
+        // again before anyone reads it (Kvasir/Hal/DmaHandoff.hpp)
+        Kvasir::Hal::takeFromHardware();
 
         // Each flag is cleared before its endpoint is told, so that the handler can arm the
         // endpoint again. What completed first is reported first: a SETUP last.
@@ -457,9 +458,7 @@ private:
                 // The 8 bytes are in endpoint 0's OUT buffer, and the next SETUP is only taken
                 // once this flag is clear (32.6.2.6) - so the packet is read first.
                 SetupPacket pkt;
-                detail::copyFromModule(
-                  std::span{reinterpret_cast<std::byte*>(std::addressof(pkt)), sizeof(pkt)},
-                  EP0_OUT::buffer.data());
+                std::memcpy(std::addressof(pkt), Ep0Out::buffer.data(), sizeof(pkt));
                 apply(reset(E::EPINTFLAG::rxstp));
                 Sink::setup(pkt);
             }
@@ -472,12 +471,6 @@ private:
                                   std::index_sequence<Ns...>) {
         ((((summary >> Ns) & 1U) != 0 ? dispatchEndpoint<Ns, Sink>() : void()), ...);
     }
-
-    template<auto Handler,
-             typename... Ts>
-    static constexpr auto makeIsr(brigand::list<Ts...>)
-      -> brigand::list<Kvasir::Nvic::Isr<Handler,
-                                         Kvasir::Nvic::Index<Ts::value>>...>;
 
 public:
     template<typename Sink>
@@ -528,7 +521,7 @@ public:
         }
 
         std::uint16_t const summary = apply(read(Regs::EPINTSMRY::FULLREGISTER));
-        dispatchEndpoints<Sink>(summary, std::make_index_sequence<Traits::EndpointCount>{});
+        dispatchEndpoints<Sink>(summary, std::make_index_sequence<Traits::endpointCount>{});
     }
 
     // DADD.ADDEN: "should be written to one to accept communications directed to this address"
@@ -547,9 +540,9 @@ public:
     // nothing armed either way, no stall, DATA1 next in both directions.
     static void beginControlTransfer() {}
 
-    static void maskInterrupt() { apply(Kvasir::Nvic::makeDisable(Traits::InterruptIndexes)); }
+    static void maskInterrupt() { apply(Kvasir::Nvic::makeDisable(Traits::interruptIndexes)); }
 
-    static void unmaskInterrupt() { apply(Kvasir::Nvic::makeEnable(Traits::InterruptIndexes)); }
+    static void unmaskInterrupt() { apply(Kvasir::Nvic::makeEnable(Traits::interruptIndexes)); }
 
     // A software reset, the pad calibration "before enabling the USB" (32.5.10), device mode at
     // full speed, the descriptor table, and the module enabled - still detached (CTRLB.DETACH is
@@ -577,6 +570,7 @@ public:
                 b.statusBk = 0;
             }
         }
+        Kvasir::Hal::handToHardware();
         apply(write(Regs::DESCADD::descadd,
                     reinterpret_cast<std::uint32_t>(std::addressof(detail::descriptorTable[0]))));
 
@@ -593,7 +587,7 @@ public:
 
     static void connect() {
         if(clockMissing) { return; }
-        apply(Kvasir::Nvic::makeEnable(Traits::InterruptIndexes));
+        apply(Kvasir::Nvic::makeEnable(Traits::interruptIndexes));
         apply(clear(Regs::CTRLB::detach));
     }
 
@@ -604,7 +598,7 @@ public:
         bool       ok    = true;
         auto const check = [&ok](bool pass, std::string_view what, std::string_view hint) {
             if(pass) {
-                UC_LOG_I("USB self-test: ok   {}", what);
+                UC_LOG_D("USB self-test: ok   {}", what);
             } else {
                 UC_LOG_E("USB self-test: FAIL {} - {}", what, hint);
                 ok = false;
@@ -638,18 +632,19 @@ public:
 
     //Kvasir Callbacks
     template<auto Handler>
-    using Isr = decltype(makeIsr<Handler>(Traits::InterruptIndexes));
+    using Isr
+      = Kvasir::Nvic::IsrsFor<Handler, std::remove_cvref_t<decltype(Traits::interruptIndexes)>>;
 
-    using Provides = brigand::list<Kvasir::Startup::Resource<InstanceTag, 0>>;
+    using Provides = brigand::list<Kvasir::Hal::Owns<Regs>>;
     // GCLK_USB at 48 MHz, which only the application's clock settings can set up.
-    using Claims = Kvasir::Clocks::Claim<Kvasir::Clocks::ClkUsb, 48'000'000>;
+    using Claims = Kvasir::Hal::Claim<Kvasir::Clocks::ClkUsb, 48'000'000>;
 
     static constexpr auto powerClockEnable = Traits::powerClockEnable;
 
     static constexpr auto initStepPinConfig = Traits::pinConfig;
 
     static constexpr auto initStepInterruptConfig
-      = list(Kvasir::Nvic::makeSetPriority<isrPriority>(Traits::InterruptIndexes),
-             Kvasir::Nvic::makeClearPending(Traits::InterruptIndexes));
+      = list(Kvasir::Nvic::makeSetPriority<isrPriority>(Traits::interruptIndexes),
+             Kvasir::Nvic::makeClearPending(Traits::interruptIndexes));
 };
 }   // namespace Kvasir::USB::Sam

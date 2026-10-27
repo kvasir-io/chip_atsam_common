@@ -1,4 +1,4 @@
-// Kvasir::Nvm::Detail::fromBits (NvmResult.hpp): which error a set of NVM controller flags is. lock wins over program
+// Kvasir::Nvm::ErrorBits::fromBits (NvmResult.hpp): which error a set of NVM controller flags is. lock wins over program
 // (an E5x erase in a locked region raises both, DS60001507N 25.6.6.6), program over nvm; no flag is success. And each
 // chip's flag positions, as its NVMCTRL_Traits::takeErrors() reads them: D21/C21 STATUS PROGE 2, LOCKE 3, NVME 4
 // (DS40001882L 22.8.7, DS60001479M 27.8.7); E5x INTFLAG ADDRE 1, PROGE 2, LOCKE 3, NVME 6 (DS60001507N 25.8.6).
@@ -8,7 +8,7 @@
 #include <cstdio>
 
 namespace N = Kvasir::Nvm;
-namespace D = Kvasir::Nvm::Detail;
+namespace D = Kvasir::Nvm::ErrorBits;
 
 namespace {
 constexpr bool is(N::Result<> r,
@@ -26,17 +26,17 @@ constexpr std::uint8_t samE5x(std::uint16_t intflag) {
 }
 
 static_assert(D::fromBits(0).has_value());
-static_assert(is(D::fromBits(D::LockBit),
+static_assert(is(D::fromBits(D::lockBit),
                  N::Error::lock));
-static_assert(is(D::fromBits(D::ProgramBit),
+static_assert(is(D::fromBits(D::programBit),
                  N::Error::program));
-static_assert(is(D::fromBits(D::NvmBit),
+static_assert(is(D::fromBits(D::nvmBit),
                  N::Error::nvm));
-static_assert(is(D::fromBits(D::LockBit | D::ProgramBit),
+static_assert(is(D::fromBits(D::lockBit | D::programBit),
                  N::Error::lock));
-static_assert(is(D::fromBits(D::ProgramBit | D::NvmBit),
+static_assert(is(D::fromBits(D::programBit | D::nvmBit),
                  N::Error::program));
-static_assert(is(D::fromBits(D::LockBit | D::ProgramBit | D::NvmBit),
+static_assert(is(D::fromBits(D::lockBit | D::programBit | D::nvmBit),
                  N::Error::lock));
 
 static_assert(D::fromBits(samD21C21(0x0002)).has_value());   // LOAD alone is no error
@@ -68,8 +68,8 @@ int main() {
     for(unsigned b = 0; b != 8; ++b) {
         auto const r  = D::fromBits(static_cast<std::uint8_t>(b));
         bool const ok = b == 0                   ? r.has_value()
-                      : (b & D::LockBit) != 0    ? is(r, N::Error::lock)
-                      : (b & D::ProgramBit) != 0 ? is(r, N::Error::program)
+                      : (b & D::lockBit) != 0    ? is(r, N::Error::lock)
+                      : (b & D::programBit) != 0 ? is(r, N::Error::program)
                                                  : is(r, N::Error::nvm);
         if(!ok) {
             std::printf("FAIL fromBits(%u)\n", b);

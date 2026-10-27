@@ -1,6 +1,7 @@
 #pragma once
 #include "EIC.hpp"
 #include "kvasir/Devices/QuadratureDecoder.hpp"
+#include "kvasir/Util/Config.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -15,7 +16,7 @@ namespace Kvasir {
 /// Config_ needs `eicPriority` (the NVIC priority of the EIC interrupt, which every line on it
 /// must share) and may have `stepsPerDetent` (4: a whole quadrature cycle per click, as the
 /// SparkFun COM-10982 does; 2: half a cycle; 1), `restState` ((A << 1) | B
-/// in a detent, 0) and `pull` (Io::PullConfiguration of both pins, PullUp; PullNone for lines
+/// in a detent, 0) and `pull` (Io::PullConfiguration of both pins, PullUp; pullNone for lines
 /// with their own resistors). The count is `cnt`, wrapping, up for A leading B - the direction
 /// SamRotaryEncoder counts the same knob. `skipped` counts changes of both lines at once (an
 /// edge the interrupt came too late for).
@@ -24,32 +25,11 @@ namespace Kvasir {
 /// starts from the lines' levels in preEnableRuntimeInit, before the EIC is switched on.
 template<typename PinA, typename PinB, typename ValueType, typename Config_>
 struct SamQuadratureEncoder {
-    static_assert(
-      requires { Config_::eicPriority; },
-      "SamQuadratureEncoder: the config needs eicPriority, the NVIC priority of the EIC "
-      "interrupt");
-
-    static constexpr unsigned stepsPerDetent = [] {
-        if constexpr(requires { Config_::stepsPerDetent; }) {
-            return static_cast<unsigned>(Config_::stepsPerDetent);
-        } else {
-            return 4U;
-        }
-    }();
-    static constexpr unsigned restState = [] {
-        if constexpr(requires { Config_::restState; }) {
-            return static_cast<unsigned>(Config_::restState);
-        } else {
-            return 0U;
-        }
-    }();
-    static constexpr auto pull = [] {
-        if constexpr(requires { Config_::pull; }) {
-            return Config_::pull;
-        } else {
-            return Kvasir::Io::PullConfiguration::PullUp;
-        }
-    }();
+    static constexpr unsigned stepsPerDetent
+      = static_cast<unsigned>(KVASIR_CONFIG_OR(Config_, stepsPerDetent, 4U));
+    static constexpr unsigned restState
+      = static_cast<unsigned>(KVASIR_CONFIG_OR(Config_, restState, 0U));
+    static constexpr auto pull = Kvasir::EIC::pullOf<Config_>;
 
     using Decoder = Kvasir::QuadratureDecoder<stepsPerDetent, restState>;
 
@@ -80,23 +60,16 @@ struct SamQuadratureEncoder {
     }
 
     template<typename Pin>
-    using Line  = Kvasir::EIC::ExtInt<Pin,
-                                      Kvasir::EIC::InterruptType::EdgeBoth,
-                                      &edgeCallback,
-                                      static_cast<int>(Config_::eicPriority),
-                                      pull,
-                                      true,
-                                      false>;
+    using Line
+      = Kvasir::EIC::HelperLine<Pin, Kvasir::EIC::InterruptType::edgeBoth, &edgeCallback, Config_>;
     using LineA = Line<PinA>;
     using LineB = Line<PinB>;
 
-    using Provides = brigand::append<typename LineA::Provides, typename LineB::Provides>;
-    using Claims   = brigand::append<typename LineA::Claims, typename LineB::Claims>;
-    using SubIsrs  = brigand::append<typename LineA::SubIsrs, typename LineB::SubIsrs>;
-
-    static constexpr auto initStepPinConfig
-      = list(LineA::initStepPinConfig, LineB::initStepPinConfig);
-    static constexpr auto initStepPeripheryConfig
-      = list(LineA::initStepPeripheryConfig, LineB::initStepPeripheryConfig);
+    using Lines                                   = Kvasir::EIC::LinesEntry<LineA, LineB>;
+    using Provides                                = typename Lines::Provides;
+    using Claims                                  = typename Lines::Claims;
+    using SubIsrs                                 = typename Lines::SubIsrs;
+    static constexpr auto initStepPinConfig       = Lines::initStepPinConfig;
+    static constexpr auto initStepPeripheryConfig = Lines::initStepPeripheryConfig;
 };
 }   // namespace Kvasir

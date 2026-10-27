@@ -1,5 +1,6 @@
 #pragma once
 #include "chip/atsam_common/Io.hpp"
+#include "chip/atsam_common/PinMux.hpp"
 #include "kvasir/Io/Types.hpp"
 #include "kvasir/Register/Register.hpp"
 
@@ -10,68 +11,57 @@ namespace Kvasir { namespace CAN { namespace Traits {
     template<typename Child>
     struct CanTraitsBase {
         struct PinInfo {
-            enum Dir { RX, TX };
+            enum Dir { rx, tx };
 
-            int canInstance;
+            int instance;   // CANn
             int port;
             int pin;
             int pinFunction;
             Dir dir;
         };
 
-        template<unsigned CanInstance>
-        static constexpr auto getCanIsrIndexs() {
-            return typename Child::template IsrIndex<CanInstance>::Type{};
+        // the row of a bonded pin for CanInstance (PinMux.hpp), or none
+        template<unsigned CanInstance,
+                 int      Port,
+                 int      Pin>
+        static constexpr std::optional<PinInfo> rowOf() {
+            if(!Kvasir::Io::isValidPinLocation<Port, Pin>()) { return std::nullopt; }
+            return Sam::findMux(Child::pinMuxInfos, CanInstance, Port, Pin);
         }
 
         template<unsigned CanInstance,
                  int      Port,
                  int      Pin>
-        static constexpr int GetPinFunction(Kvasir::Register::PinLocation<Port,
-                                                                          Pin>) {
-            if(!Kvasir::Io::isValidPinLocation<Port, Pin>()) {
-                return std::numeric_limits<int>::max();
-            }
-            for(auto mi : Child::pinMuxInfos) {
-                if(mi.canInstance != CanInstance) { continue; }
-                if(mi.port != Port) { continue; }
-                if(mi.pin != Pin) { continue; }
-                return mi.pinFunction;
-            }
-            return std::numeric_limits<int>::max();
+        static constexpr int getPinFunction(Kvasir::Io::PinLocation<Port,
+                                                                    Pin>) {
+            auto const row = rowOf<CanInstance, Port, Pin>();
+            return row ? row->pinFunction : std::numeric_limits<int>::max();
         }
 
         template<unsigned CanInstance,
                  int      Port,
                  int      Pin>
-        static constexpr bool isDir(Kvasir::Register::PinLocation<Port,
-                                                                  Pin>,
+        static constexpr bool isDir(Kvasir::Io::PinLocation<Port,
+                                                            Pin>,
                                     typename PinInfo::Dir dir) {
-            if(!Kvasir::Io::isValidPinLocation<Port, Pin>()) { return false; }
-            for(auto mi : Child::pinMuxInfos) {
-                if(mi.canInstance != CanInstance) { continue; }
-                if(mi.port != Port) { continue; }
-                if(mi.pin != Pin) { continue; }
-                if(mi.dir != dir) { continue; }
-                return true;
-            }
-            return false;
+            auto const row = rowOf<CanInstance, Port, Pin>();
+            return row && row->dir == dir;
         }
 
         template<unsigned CanInstance,
                  int      Port,
                  int      Pin>
-        static constexpr bool isRX(Kvasir::Register::PinLocation<Port,
-                                                                 Pin> p) {
-            return isDir<CanInstance>(p, PinInfo::RX);
+        static constexpr bool isRX(Kvasir::Io::PinLocation<Port,
+                                                           Pin> p) {
+            return isDir<CanInstance>(p, PinInfo::rx);
         }
 
         template<unsigned CanInstance,
                  int      Port,
                  int      Pin>
-        static constexpr bool isTX(Kvasir::Register::PinLocation<Port,
-                                                                 Pin> p) {
-            return isDir<CanInstance>(p, PinInfo::TX);
+        static constexpr bool isTX(Kvasir::Io::PinLocation<Port,
+                                                           Pin> p) {
+            return isDir<CanInstance>(p, PinInfo::tx);
         }
     };
 

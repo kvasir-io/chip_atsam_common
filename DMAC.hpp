@@ -1,97 +1,26 @@
 #pragma once
-#include "chip/Dmac_Traits.hpp"
 #include "chip/PM.hpp"
+#include "chip/Package.hpp"
+#include "chip/WaitBounds.hpp"
+#include "chip/atsam_common/DmacCrc.hpp"   // Kvasir::DmaCrc, the CRC engine of the same block
+#include "chip/atsam_common/DmacDescriptor.hpp"
+#include "kvasir/Hal/Dma.hpp"
+#include "kvasir/Hal/DmaHandoff.hpp"
+#include "kvasir/Hal/Owns.hpp"
 #include "kvasir/Register/Register.hpp"
 #include "kvasir/Register/Utility.hpp"
-#include "kvasir/Util/Crc.hpp"
 #include "peripherals/DMAC.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
 #include <type_traits>
+#include <utility>
 
-namespace Kvasir {
-namespace DMAC {
-    struct alignas(16) DmacDescriptor {
-        enum class stepsize : unsigned char {
-            x1   = 0x00,
-            x2   = 0x01,
-            x4   = 0x02,
-            x8   = 0x03,
-            x16  = 0x04,
-            x32  = 0x05,
-            x64  = 0x06,
-            x128 = 0x07
-        };
-
-        enum class stepsel : unsigned char { dst = 0x00, src = 0x01 };
-
-        enum class dstinc : unsigned char { no_increment = 0x00, increment = 0x01 };
-
-        enum class srcinc : unsigned char { no_increment = 0x00, increment = 0x01 };
-
-        enum class beatsize : unsigned char {
-            byte  = 0x00,
-            hword = 0x01,
-            word  = 0x02,
-        };
-
-        enum class blockact : unsigned char {
-            noact     = 0x00,
-            interrupt = 0x01,
-            suspend   = 0x02,
-            both      = 0x03,
-        };
-
-        enum class evosel : unsigned char {
-            disabled = 0x00,
-            block    = 0x01,
-            beat     = 0x03,
-        };
-
-        constexpr DmacDescriptor()
-          : BTCTRL{}
-          , BTCNT{}
-          , SRCADDR{}
-          , DSTADDR{}
-          , DESCADDR{} {}
-
-        constexpr DmacDescriptor(bool          valid,
-                                 stepsize      stsize,
-                                 stepsel       stsel,
-                                 dstinc        dinc,
-                                 srcinc        sinc,
-                                 beatsize      bsize,
-                                 blockact      bact,
-                                 evosel        esel,
-                                 std::uint16_t beatcount,
-                                 std::uint32_t srcaddr,
-                                 std::uint32_t dstaddr)
-          : BTCTRL(std::uint16_t((valid ? 1U : 0U) | (unsigned(esel) << 1U) | (unsigned(bact) << 3U)
-                                 | (unsigned(bsize) << 8U) | (unsigned(sinc) << 10U)
-                                 | (unsigned(dinc) << 11U) | (unsigned(stsel) << 12U)
-                                 | (unsigned(stsize) << 13U)))
-          , BTCNT(beatcount)
-          , SRCADDR(srcaddr)
-          , DSTADDR(dstaddr)
-          , DESCADDR(0) {}
-
-        bool isValid() const {
-            return ((*reinterpret_cast<std::uint16_t const volatile*>(&BTCTRL)) & 0x0001U) != 0;
-        }
-
-        void setisValid(bool b) { BTCTRL = b ? BTCTRL | 1U : BTCTRL & 0xFFFEU; }
-
-        std::uint16_t BTCTRL;
-        std::uint16_t BTCNT;
-        std::uint32_t SRCADDR;
-        std::uint32_t DSTADDR;
-        std::uint32_t DESCADDR;
-    };
-
-    static_assert(sizeof(DmacDescriptor) == 16);
-
+namespace Kvasir { namespace DMAC {
+    // A channel number; a channel past the chip's (D21/C21 12, E5x 32: DmacTraits::Channels) is refused where a
+    // DmaBase names it (rd(), start(), Claims: it has no descriptor).
     enum class DMAChannel {
         ch0  = 0,
         ch1  = 1,
@@ -105,6 +34,26 @@ namespace DMAC {
         ch9  = 9,
         ch10 = 10,
         ch11 = 11,
+        ch12 = 12,
+        ch13 = 13,
+        ch14 = 14,
+        ch15 = 15,
+        ch16 = 16,
+        ch17 = 17,
+        ch18 = 18,
+        ch19 = 19,
+        ch20 = 20,
+        ch21 = 21,
+        ch22 = 22,
+        ch23 = 23,
+        ch24 = 24,
+        ch25 = 25,
+        ch26 = 26,
+        ch27 = 27,
+        ch28 = 28,
+        ch29 = 29,
+        ch30 = 30,
+        ch31 = 31,
     };
 
     enum class DMAPriority {
@@ -114,7 +63,57 @@ namespace DMAC {
         p3,
     };
 
-    using TriggerSource = Traits::DmacTraits::TriggerSource;
+    using TriggerSource = Sam::Package::Dmac::TriggerSource;
+
+    namespace Detail {
+        template<unsigned Channel>
+        using ChannelResource = Hal::DmaChannel<Peripheral::DMAC::Registers<>, Channel>;
+
+        template<typename Seq>
+        struct ChannelResources;
+
+        template<std::size_t... Is>
+        struct ChannelResources<std::index_sequence<Is...>> {
+            using type = brigand::list<ChannelResource<static_cast<unsigned>(Is)>...>;
+        };
+
+        // The DMAC's registers as a name that depends on the channel: start()/stop()/takeEvent() name the D2x/C2x
+        // window (CHID, CHCTRLB) in one if-constexpr arm and the E5x's CHANNEL<n> in the other, and only an arm whose
+        // names are dependent is left unchecked when it is discarded.
+        template<typename Regs, auto>
+        struct DependentOn {
+            using type = Regs;
+        };
+
+        template<std::size_t N>
+        constexpr bool allDistinct(std::array<unsigned,
+                                              N> const& v) {
+            for(std::size_t i = 0; i < N; ++i) {
+                for(std::size_t j = i + 1; j < N; ++j) {
+                    if(v[i] == v[j]) { return false; }
+                }
+            }
+            return true;
+        }
+    }   // namespace Detail
+
+    // What a driver puts in its `Claims`: `Kvasir::DMAC::Claims<Dma, TxChannel, RxChannel>`. The
+    // two checks a driver can make on its own are made here, with the driver in the error; the
+    // cross-peripheral ones (two drivers on a channel, no DmaBase listed) are Startup's.
+    template<typename Dma, DMAChannel... Cs>
+    struct ClaimsFor {
+        static_assert(
+          ((static_cast<std::size_t>(Cs) < Dma::numberOfChannels) && ...),
+          "a driver's DMA channel is not one of its DmaBase's channels (numberOfChannels): "
+          "it has no descriptor");
+        static_assert(Detail::allDistinct(std::array<unsigned,
+                                                     sizeof...(Cs)>{static_cast<unsigned>(Cs)...}),
+                      "a driver names the same DMA channel twice");
+        using type = brigand::list<Detail::ChannelResource<static_cast<unsigned>(Cs)>...>;
+    };
+
+    template<typename Dma, DMAChannel... Cs>
+    using Claims = typename ClaimsFor<Dma, Cs...>::type;
 
     template<typename DMAConfig>
     struct DmaBase {
@@ -122,7 +121,9 @@ namespace DMAC {
         // numberOfChannels
         static constexpr auto numberOfChannels = DMAConfig::numberOfChannels;
 
-        static_assert(Traits::DmacTraits::Channels >= numberOfChannels);
+        static_assert(Sam::Package::Dmac::channels >= numberOfChannels,
+                      "DMAConfig::numberOfChannels: more DMA channels than this chip has "
+                      "(Sam::Package::Dmac::Channels: D21/C21 12, E5x 32)");
 
         static inline std::array<DmacDescriptor, numberOfChannels> rdescriptors{};
         static inline std::array<DmacDescriptor, numberOfChannels> wdescriptors{};
@@ -130,7 +131,14 @@ namespace DMAC {
         using Regs                   = Peripheral::DMAC::Registers<>;
         static constexpr unsigned ba = Regs::baseAddr;
 
-        static constexpr auto powerClockEnable = list(typename PM::enable<ba>::action{});
+        // Startup: the controller (one DmaBase per image) and its channels 0..numberOfChannels-1;
+        // a driver claims the ones it runs on (DMAC::Claims below), so two drivers on one channel,
+        // or a driver on a channel past numberOfChannels or without a listed DmaBase, do not build.
+        using Provides = brigand::append<
+          brigand::list<Hal::Owns<Regs>>,
+          typename Detail::ChannelResources<std::make_index_sequence<numberOfChannels>>::type>;
+
+        static constexpr auto powerClockEnable = list(typename PM::Enable<ba>::action{});
 
         template<DMAChannel Channel>
         static constexpr DmacDescriptor& rd() {
@@ -157,34 +165,34 @@ namespace DMAC {
 
         template<DMAChannel    Channel,
                  DMAPriority   Priority,
-                 TriggerSource Trigger,
-                 typename Regs_t>
+                 TriggerSource Trigger>
         static constexpr auto start() {
+            using R = typename Detail::DependentOn<Regs, Channel>::type;
             static_assert(numberOfChannels > static_cast<std::size_t>(Channel));
 
-            if constexpr(Traits::DmacTraits::OldImpl) {
+            if constexpr(Sam::Package::Dmac::channelSelectedByChid) {
                 return list(
                   write(
-                    Regs_t::CHID::id,
+                    R::CHID::id,
                     Kvasir::Register::value<std::uint8_t, static_cast<std::uint8_t>(Channel)>()),
                   Kvasir::Register::sequencePoint,
-                  write(Regs_t::CHCTRLB::CMDValC::noact),
-                  write(Regs_t::CHCTRLB::TRIGACTValC::beat),
-                  write(Regs_t::CHCTRLB::trigsrc,
-                        Register::value<typename Regs_t::CHCTRLB::TRIGSRCVal, Trigger>()),
-                  write(Regs_t::CHCTRLB::lvl,
-                        Register::value<typename Regs_t::CHCTRLB::LVLVal,
-                                        static_cast<typename Regs_t::CHCTRLB::LVLVal>(
-                                          static_cast<int>(Regs_t::CHCTRLB::LVLVal::lvl0)
+                  write(R::CHCTRLB::CMDValC::noact),
+                  write(R::CHCTRLB::TRIGACTValC::beat),
+                  write(R::CHCTRLB::trigsrc,
+                        Register::value<typename R::CHCTRLB::TRIGSRCVal, Trigger>()),
+                  write(R::CHCTRLB::lvl,
+                        Register::value<typename R::CHCTRLB::LVLVal,
+                                        static_cast<typename R::CHCTRLB::LVLVal>(
+                                          static_cast<int>(R::CHCTRLB::LVLVal::lvl0)
                                           + static_cast<int>(Priority))>()),
-                  clear(Regs_t::CHCTRLB::evoe),
-                  clear(Regs_t::CHCTRLB::evie),
-                  write(Regs_t::CHCTRLB::EVACTValC::noact),
+                  clear(R::CHCTRLB::evoe),
+                  clear(R::CHCTRLB::evie),
+                  write(R::CHCTRLB::EVACTValC::noact),
                   Kvasir::Register::sequencePoint,
-                  set(Regs_t::CHCTRLA::enable),
-                  clear(Regs_t::CHCTRLA::swrst));
+                  set(R::CHCTRLA::enable),
+                  clear(R::CHCTRLA::swrst));
             } else {
-                using CHRegs = typename Regs_t::template CHANNEL<static_cast<std::size_t>(Channel)>;
+                using CHRegs = typename R::template CHANNEL<static_cast<std::size_t>(Channel)>;
                 return list(
                   CHRegs::CHCTRLA::overrideDefaults(),
 
@@ -210,79 +218,71 @@ namespace DMAC {
             }
         }
 
-        template<DMAChannel    Channel,
-                 DMAPriority   Priority,
-                 TriggerSource Trigger>
-        static constexpr auto start() {
-            return start<Channel, Priority, Trigger, Regs>();
-        }
-
         /// Disable one channel: what an aborted transfer needs, so the channel stops moving
         /// bytes and the next start() finds it idle.
-        template<DMAChannel Channel,
-                 typename Regs_t>
+        template<DMAChannel Channel>
         static constexpr auto stop() {
+            using R = typename Detail::DependentOn<Regs, Channel>::type;
             static_assert(numberOfChannels > static_cast<std::size_t>(Channel));
 
-            if constexpr(Traits::DmacTraits::OldImpl) {
+            if constexpr(Sam::Package::Dmac::channelSelectedByChid) {
                 return list(
                   write(
-                    Regs_t::CHID::id,
+                    R::CHID::id,
                     Kvasir::Register::value<std::uint8_t, static_cast<std::uint8_t>(Channel)>()),
                   Kvasir::Register::sequencePoint,
-                  clear(Regs_t::CHCTRLA::enable));
+                  clear(R::CHCTRLA::enable));
             } else {
-                using CHRegs = typename Regs_t::template CHANNEL<static_cast<std::size_t>(Channel)>;
+                using CHRegs = typename R::template CHANNEL<static_cast<std::size_t>(Channel)>;
                 return list(clear(CHRegs::CHCTRLA::enable));
             }
         }
 
-        template<DMAChannel Channel>
-        static constexpr auto stop() {
-            return stop<Channel, Regs>();
-        }
-
-        // A disabled channel finishes its beat and its write-back first: CHCTRLA.ENABLE reads 1
-        // until then (DS40001882L 20.6.3.6, 20.8.18; C21 DS60001479 and E5x DS60001507 say the
-        // same). A few bus cycles; hitting this bound means the channel is wedged.
-        static constexpr int StopPollLimit = 10000;
-
         /// stop(), then wait until the channel really is off, so a following start() or a
-        /// peripheral reset does not race the last beat. Returns false if it never was.
-        template<DMAChannel Channel,
-                 typename Regs_t = Regs>
+        /// peripheral reset does not race the last beat. A disabled channel finishes its beat and
+        /// its write-back first: CHCTRLA.ENABLE reads 1 until then (Sam::DmaChannelStopBound,
+        /// whatever policy the application injects: the caller recovers). Returns false if it
+        /// never was off - the channel is wedged.
+        template<DMAChannel Channel>
         static bool stopAndWait() {
-            apply(stop<Channel, Regs_t>());
-            for(int i = 0; i < StopPollLimit; ++i) {
-                if constexpr(Traits::DmacTraits::OldImpl) {
+            using R = typename Detail::DependentOn<Regs, Channel>::type;
+            apply(stop<Channel>());
+            // one CHID write per poll on the D21/C21, as before
+            auto const off = [] {
+                if constexpr(Sam::Package::Dmac::channelSelectedByChid) {
                     apply(write(
-                      Regs_t::CHID::id,
+                      R::CHID::id,
                       Kvasir::Register::value<std::uint8_t, static_cast<std::uint8_t>(Channel)>()));
-                    if(apply(read(Regs_t::CHCTRLA::enable)) == 0) { return true; }
+                    return apply(read(R::CHCTRLA::enable)) == 0;
                 } else {
-                    using CHRegs =
-                      typename Regs_t::template CHANNEL<static_cast<std::size_t>(Channel)>;
-                    if(apply(read(CHRegs::CHCTRLA::enable)) == 0) { return true; }
+                    using CHRegs = typename R::template CHANNEL<static_cast<std::size_t>(Channel)>;
+                    return apply(read(CHRegs::CHCTRLA::enable)) == 0;
                 }
-            }
-            return false;
+            };
+            bool const stopped = static_cast<bool>(
+              Kvasir::Register::waitUntil<Kvasir::Chip::Sam::DmaChannelStopBound,
+                                          Kvasir::Register::OnTimeout::Report>(off));
+            // the descriptors and buffers are the core's again (Kvasir/Hal/DmaHandoff.hpp)
+            Hal::takeFromHardware();
+            return stopped;
         }
 
         enum class ChannelEvent : std::uint8_t { none, complete, error };
 
         /// Reads and clears CHINTFLAG TERR/TCMPL; set even with the interrupt off (DS40001882L
-        /// 20.6.5). Uses CHID on the D21/C21.
-        template<DMAChannel Channel,
-                 typename Regs_t = Regs>
+        /// 20.6.5). Uses CHID on the D21/C21. A caller that goes on to read what the channel wrote
+        /// calls Hal::takeFromHardware() after an event first.
+        template<DMAChannel Channel>
         static ChannelEvent takeEvent() {
+            using R = typename Detail::DependentOn<Regs, Channel>::type;
             static_assert(numberOfChannels > static_cast<std::size_t>(Channel));
-            if constexpr(Traits::DmacTraits::OldImpl) {
+            if constexpr(Sam::Package::Dmac::channelSelectedByChid) {
                 apply(write(
-                  Regs_t::CHID::id,
+                  R::CHID::id,
                   Kvasir::Register::value<std::uint8_t, static_cast<std::uint8_t>(Channel)>()));
-                return takeFlags<typename Regs_t::CHINTFLAG>();
+                return takeFlags<typename R::CHINTFLAG>();
             } else {
-                using CHRegs = typename Regs_t::template CHANNEL<static_cast<std::size_t>(Channel)>;
+                using CHRegs = typename R::template CHANNEL<static_cast<std::size_t>(Channel)>;
                 return takeFlags<typename CHRegs::CHINTFLAG>();
             }
         }
@@ -292,135 +292,12 @@ namespace DMAC {
         template<typename Flags>
         [[gnu::always_inline]] static ChannelEvent takeFlags() {
             auto const flags = static_cast<std::uint8_t>(get<0>(apply(read(Flags::FULLREGISTER)))
-                                                         & (Flags::terr.Mask | Flags::tcmpl.Mask));
+                                                         & (Flags::terr.mask | Flags::tcmpl.mask));
             if(flags != 0) { apply(write(Flags::FULLREGISTER, flags)); }
-            if((flags & Flags::terr.Mask) != 0) { return ChannelEvent::error; }
-            if((flags & Flags::tcmpl.Mask) != 0) { return ChannelEvent::complete; }
+            if((flags & Flags::terr.mask) != 0) { return ChannelEvent::error; }
+            if((flags & Flags::tcmpl.mask) != 0) { return ChannelEvent::complete; }
             return ChannelEvent::none;
         }
     };
 
-}   // namespace DMAC
-
-namespace CRC {
-
-    namespace detail {
-        template<typename CRC>
-        void reset_crc() {
-            if constexpr(requires {
-                             { CRC::CTRL::crcenable };
-                         })
-            {
-                if(1 == apply(read(CRC::CTRL::crcenable))) { apply(set(CRC::CRCSTATUS::crcbusy)); }
-                apply(clear(CRC::CTRL::crcenable));
-            } else {
-                apply(CRC::CRCCTRL::overrideDefaults());
-            }
-        }
-
-        template<typename CRC>
-        void enable_crc() {
-            if constexpr(requires {
-                             { CRC::CTRL::crcenable };
-                         })
-            {
-                apply(set(CRC::CTRL::crcenable));
-            }
-        }
-    }   // namespace detail
-
-    enum class CRC_Type { crc16, crc32 };
-
-    template<CRC_Type Crc,
-             typename It>
-    auto calcCrc(It start,
-                 It end) {
-        using CRC = Peripheral::DMAC::Registers<>;
-
-        static constexpr std::size_t dataSize = sizeof(decltype(*start));
-        static_assert(dataSize == 1 || dataSize == 2 || dataSize == 4, "wrong data size");
-
-        detail::reset_crc<CRC>();
-
-        auto crcTypes = []() {
-            if constexpr(Crc == CRC_Type::crc16) {
-                return std::make_tuple(write(CRC::CRCCTRL::CRCPOLYValC::crc16),
-                                       read(CRC::CRCCHKSUM::crcchksum16));
-            } else {
-                return std::make_tuple(write(CRC::CRCCTRL::CRCPOLYValC::crc32),
-                                       read(CRC::CRCCHKSUM::crcchksum32));
-            }
-        }();
-
-        auto beatsize = []() {
-            if constexpr(dataSize == 1) {
-                return write(CRC::CRCCTRL::CRCBEATSIZEValC::byte);
-            } else if constexpr(dataSize == 2) {
-                return write(CRC::CRCCTRL::CRCBEATSIZEValC::hword);
-            } else {
-                return write(CRC::CRCCTRL::CRCBEATSIZEValC::word);
-            }
-        }();
-
-        apply(write(CRC::CRCCHKSUM::crcchksum32, Kvasir::Register::value<0xFFFFFFFF>()));
-
-        apply(std::get<0>(crcTypes), beatsize, write(CRC::CRCCTRL::CRCSRCValC::io));
-
-        detail::enable_crc<CRC>();
-        while(start != end) {
-            if constexpr(dataSize == 1) {
-                apply(write(CRC::CRCDATAIN::crcdatain8, static_cast<std::uint8_t>(*start)));
-            } else if constexpr(dataSize == 2) {
-                apply(write(CRC::CRCDATAIN::crcdatain16, static_cast<std::uint16_t>(*start)));
-            } else {
-                apply(write(CRC::CRCDATAIN::crcdatain, static_cast<std::uint32_t>(*start)));
-            }
-            ++start;
-        }
-        apply(set(CRC::CRCSTATUS::crcbusy));
-        return static_cast<
-          std::conditional_t<Crc == CRC_Type::crc16, std::uint16_t, std::uint32_t>>(
-          Kvasir::Register::get<0>(apply(std::get<1>(crcTypes))));
-    }
-
-    template<CRC_Type Crc,
-             typename T>
-    auto calcCrc(T const& v) {
-        return calcCrc<Crc>(reinterpret_cast<std::uint8_t const*>(&v),
-                            reinterpret_cast<std::uint8_t const*>(&v + 1));
-    }
-
-    /// The `type` + `calc(span)` shape (Kvasir::Crc::Calc's) over the DMAC's CRC engine, for the
-    /// two Kvasir::Crc presets it computes: CRC-16 polynomial 0x1021 and CRC-32 0x04C11DB7, both
-    /// seeded with all ones above, the CRC-32 checksum read bit-reversed and complemented (SAM D21
-    /// DS40001882 20.6.3.7 and Figure 20-16) - CRC-16/IBM-3740 and CRC-32/ISO-HDLC. Any other
-    /// preset does not compile. Not yet compared with the software engine on a board.
-    template<auto P>
-    struct DmacCalc {
-        using type = std::remove_cvref_t<decltype(P.poly)>;
-
-        static constexpr bool Crc16 = P.width == Kvasir::Crc::Presets::crc16Ibm3740.width
-                                   && P.poly == Kvasir::Crc::Presets::crc16Ibm3740.poly
-                                   && P.init == Kvasir::Crc::Presets::crc16Ibm3740.init
-                                   && P.refin == Kvasir::Crc::Presets::crc16Ibm3740.refin
-                                   && P.refout == Kvasir::Crc::Presets::crc16Ibm3740.refout
-                                   && P.xorout == Kvasir::Crc::Presets::crc16Ibm3740.xorout;
-        static constexpr bool Crc32 = P.width == Kvasir::Crc::Presets::crc32IsoHdlc.width
-                                   && P.poly == Kvasir::Crc::Presets::crc32IsoHdlc.poly
-                                   && P.init == Kvasir::Crc::Presets::crc32IsoHdlc.init
-                                   && P.refin == Kvasir::Crc::Presets::crc32IsoHdlc.refin
-                                   && P.refout == Kvasir::Crc::Presets::crc32IsoHdlc.refout
-                                   && P.xorout == Kvasir::Crc::Presets::crc32IsoHdlc.xorout;
-        static_assert(Crc16 || Crc32,
-                      "the DMAC computes CRC-16/IBM-3740 and CRC-32/ISO-HDLC only");
-
-        static type calc(std::span<std::byte const> data) {
-            auto const* const first = reinterpret_cast<std::uint8_t const*>(data.data());
-            return static_cast<type>(
-              calcCrc<Crc16 ? CRC_Type::crc16 : CRC_Type::crc32>(first, first + data.size()));
-        }
-    };
-
-}   // namespace CRC
-
-}   // namespace Kvasir
+}}   // namespace Kvasir::DMAC

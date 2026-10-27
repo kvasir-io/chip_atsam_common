@@ -1,6 +1,7 @@
 #pragma once
 #include "EIC.hpp"
 #include "kvasir/Devices/RotaryEncoder.hpp"
+#include "kvasir/Util/Config.hpp"
 
 namespace Kvasir {
 /// A RotaryEncoder whose A pin is an EXTINT line (pull-up unless `pull` says otherwise, the EIC's
@@ -17,49 +18,32 @@ namespace Kvasir {
 /// `pull` (Io::PullConfiguration, PullUp) is PinA's pull; PinB is a plain input either way.
 /// A wrapper that wants its own edge callback takes `EicLineWith<&itsCallback>` as its SubIsrs.
 template<typename Clock, typename PinA, typename PinB, typename ValueType, typename Config_>
-struct SamRotaryEncoder : Kvasir::RotaryEncoder<Clock, PinA, PinB, ValueType, Config_> {
+struct SamRotaryEncoder
+  : Kvasir::RotaryEncoder<Clock, PinA, PinB, ValueType, Config_>
+  , Kvasir::EIC::LinesEntry<Kvasir::EIC::HelperLine<
+      PinA,
+      KVASIR_CONFIG_OR(Config_, edge, Kvasir::EIC::InterruptType::edgeBoth),
+      &Kvasir::RotaryEncoder<Clock, PinA, PinB, ValueType, Config_>::edgeCallback,
+      Config_>> {
     using Base = Kvasir::RotaryEncoder<Clock, PinA, PinB, ValueType, Config_>;
     using Base::cnt;
 
-    static constexpr auto edge = [] {
-        if constexpr(requires { Config_::edge; }) {
-            return Config_::edge;
-        } else {
-            return Kvasir::EIC::InterruptType::EdgeBoth;
-        }
-    }();
-    static_assert(edge == Kvasir::EIC::InterruptType::EdgeBoth
-                    || edge == Kvasir::EIC::InterruptType::EdgeRise
-                    || edge == Kvasir::EIC::InterruptType::EdgeFall,
+    static constexpr auto edge
+      = KVASIR_CONFIG_OR(Config_, edge, Kvasir::EIC::InterruptType::edgeBoth);
+    static_assert(edge == Kvasir::EIC::InterruptType::edgeBoth
+                    || edge == Kvasir::EIC::InterruptType::edgeRise
+                    || edge == Kvasir::EIC::InterruptType::edgeFall,
                   "edge has to be one of the Edge* interrupt types");
-    static_assert(
-      requires { Config_::eicPriority; },
-      "SamRotaryEncoder: the config needs eicPriority, the NVIC priority of the EIC "
-      "interrupt");
 
-    // PullUp unless the config says otherwise: PullNone or PullDown for a line with an external
-    // pull resistor, which the 20-60 k internal pull-up (SAM C21 DS60001479M RPULL md l.50199)
-    // would otherwise fight.
-    static constexpr auto pull = [] {
-        if constexpr(requires { Config_::pull; }) {
-            return Config_::pull;
-        } else {
-            return Kvasir::Io::PullConfiguration::PullUp;
-        }
-    }();
+    static constexpr auto pull = Kvasir::EIC::pullOf<Config_>;
 
     template<auto Callback>
-    using EicLineWith = Kvasir::EIC::
-      ExtInt<PinA, edge, Callback, static_cast<int>(Config_::eicPriority), pull, true, false>;
-    using EicLine = EicLineWith<&Base::edgeCallback>;
+    using EicLineWith = Kvasir::EIC::HelperLine<PinA, edge, Callback, Config_>;
+    using EicLine     = EicLineWith<&Base::edgeCallback>;
 
-    using Provides = typename EicLine::Provides;
-    using Claims   = typename EicLine::Claims;
-    using SubIsrs  = typename EicLine::SubIsrs;
     // B is only read: "If the Input Enable bit in the Pin Configuration registers
     // (PINCFGy.INEN) is '0', the input value will not be sampled" (SAM C21 data sheet, PORT,
     // SAMC20_C21_Family_Datasheet.md 20208; the D21's PINCFG.INEN, md 17597, says the same)
     static constexpr auto initStepPinConfig = list(makeInput(PinB{}), EicLine::initStepPinConfig);
-    static constexpr auto initStepPeripheryConfig = EicLine::initStepPeripheryConfig;
 };
 }   // namespace Kvasir

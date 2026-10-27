@@ -1,226 +1,165 @@
 #pragma once
 #include "DMAC.hpp"
-#include "WaitBounds.hpp"
-//#include "chip/MCLK.hpp"
 #include "chip/PM.hpp"
-#include "chip/Sercom_Traits.hpp"
+#include "chip/Package.hpp"
+#include "chip/WaitBounds.hpp"
+#include "chip/atsam_common/Clocks.hpp"
+#include "chip/atsam_common/SercomBaud.hpp"
 #include "kvasir/Atomic/Queue.hpp"
+#include "kvasir/Hal/Clocks.hpp"
+#include "kvasir/Hal/DmaHandoff.hpp"
+#include "kvasir/Hal/Owns.hpp"
+#include "kvasir/Hal/Uart.hpp"
 #include "kvasir/Io/Types.hpp"
-#include "kvasir/Mpl/Utility.hpp"
 #include "kvasir/Register/Register.hpp"
+#include "kvasir/Util/Config.hpp"
 #include "kvasir/Util/Prescaler.hpp"
-#include "peripherals/SERCOM_USART.hpp"
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <ratio>
+#include <span>
+#include <type_traits>
 
 namespace Kvasir { namespace Sercom { namespace Usart {
-    template<typename = void>
-    struct NotUsed {};
-
-    enum class DataBits {
-        _5,
-        _6,
-        _7,
-        _8,
-        _9,
-    };
-
-    enum class Parity {
-        none,
-        odd,
-        even,
-    };
-
-    enum class StopBits {
-        _1,
-        _2,
-    };
-
     namespace Detail {
 
         template<unsigned SercomInstance>
         struct Config {
-            using Regs = Kvasir::Peripheral::SERCOM_USART::Registers<SercomInstance>;
+            using Regs = Sam::Package::SercomUsart<SercomInstance>;
 
-            static constexpr bool isValidPinLocationRX(NotUsed<>) { return true; }
-
-            template<int Port,
-                     int Pin>
-            static constexpr bool isValidPinLocationRX(Kvasir::Register::PinLocation<Port,
-                                                                                     Pin>) {
-                return Traits::SercomTraits::ValidIfPOVal<SercomInstance, Port, Pin>(0, 1, 2, 3);
-            }
-
-            static constexpr bool isValidPinLocationTX(NotUsed<>) { return true; }
+            static constexpr bool isValidPinLocationRX(Io::NotUsed<>) { return true; }
 
             template<int Port,
                      int Pin>
-            static constexpr bool isValidPinLocationTX(Kvasir::Register::PinLocation<Port,
-                                                                                     Pin>) {
-                return Traits::SercomTraits::ValidIfPOVal<SercomInstance, Port, Pin>(0, 2);
+            static constexpr bool isValidPinLocationRX(Kvasir::Io::PinLocation<Port,
+                                                                               Pin>) {
+                return Sam::Package::Sercom::validIfPOVal<SercomInstance, Port, Pin>(0, 1, 2, 3);
             }
 
-            template<int LPort,
-                     int LPin,
-                     int RPort,
-                     int RPin>
-            static constexpr bool PinLocationAreTheSame(Kvasir::Register::PinLocation<LPort,
-                                                                                      LPin> l,
-                                                        Kvasir::Register::PinLocation<RPort,
-                                                                                      RPin> r) {
-                return Io::Detail::PinLocationEqual(l, r);
-            }
-
-            template<int LPort,
-                     int LPin>
-            static constexpr bool PinLocationAreTheSame(Kvasir::Register::PinLocation<LPort,
-                                                                                      LPin>,
-                                                        NotUsed<>) {
-                return false;
-            }
-
-            template<int RPort,
-                     int RPin>
-            static constexpr bool PinLocationAreTheSame(NotUsed<>,
-                                                        Kvasir::Register::PinLocation<RPort,
-                                                                                      RPin>) {
-                return false;
-            }
+            static constexpr bool isValidPinLocationTX(Io::NotUsed<>) { return true; }
 
             template<int Port,
                      int Pin>
-            static constexpr int GetRxPadValue(Kvasir::Register::PinLocation<Port,
-                                                                             Pin>) {
-                if(!Kvasir::Io::isValidPinLocation<Port, Pin>()) {
-                    return std::numeric_limits<int>::max();
-                }
-                for(auto mi : Traits::SercomTraits::pinMuxInfos) {
-                    if(mi.sercomInstance != SercomInstance) { continue; }
-                    if(mi.port != Port) { continue; }
-                    if(mi.pin != Pin) { continue; }
-                    return mi.POVal;
-                }
-                return std::numeric_limits<int>::max();
+            static constexpr bool isValidPinLocationTX(Kvasir::Io::PinLocation<Port,
+                                                                               Pin>) {
+                return Sam::Package::Sercom::validIfPOVal<SercomInstance, Port, Pin>(0, 2);
             }
 
+            // TXPO from the chip's pad table (SercomPads.hpp): TxD on a pad the chip does not offer is a compile
+            // error naming the pad and the chip
             template<int Port,
                      int Pin>
-            static constexpr int GetTxPadValue(Kvasir::Register::PinLocation<Port,
-                                                                             Pin>) {
-                if(!Kvasir::Io::isValidPinLocation<Port, Pin>()) {
-                    return std::numeric_limits<int>::max();
-                }
-                for(auto mi : Traits::SercomTraits::pinMuxInfos) {
-                    if(mi.sercomInstance != SercomInstance) { continue; }
-                    if(mi.port != Port) { continue; }
-                    if(mi.pin != Pin) { continue; }
-                    if(mi.POVal == 1 || mi.POVal == 3) { continue; }
-
-                    if(mi.POVal == 0) { return mi.POVal; }
-                    return mi.POVal - 1;
-                }
-                return std::numeric_limits<int>::max();
+            static constexpr int getTxPadValue(Kvasir::Io::PinLocation<Port,
+                                                                       Pin>) {
+                return Sam::Pads::txpo<Sam::Package::SercomPads,
+                                       Sam::Package::Sercom::getPOVal<SercomInstance>(
+                                         Io::PinLocation<Port, Pin>{})>();
             }
 
             template<typename RXPIN>
             struct GetRxPinConfig;
 
-            template<typename dummy>
-            struct GetRxPinConfig<NotUsed<dummy>> {
-                using pad       = decltype(write(Regs::CTRLA::rxpo, Register::value<0>()));
+            template<typename Dummy>
+            struct GetRxPinConfig<Io::NotUsed<Dummy>> {
+                using pad       = decltype(write(Regs::CTRLA::rxpo,
+                                                 fieldValue<decltype(Regs::CTRLA::rxpo), 0>()));
                 using enable    = decltype(clear(Regs::CTRLB::rxen));
-                using pinConfig = brigand::list<>;
+                using PinConfig = brigand::list<>;
                 using interrupt = brigand::list<>;
                 template<typename InterruptIndex>
-                using interruptEnable = brigand::list<>;
+                using InterruptEnable = brigand::list<>;
             };
 
             template<int Port, int Pin>
-            struct GetRxPinConfig<Kvasir::Register::PinLocation<Port, Pin>> {
-                using pad       = decltype(write(
-                  Regs::CTRLA::rxpo,
-                  Register::value<GetRxPadValue(Register::PinLocation<Port, Pin>{})>()));
+            struct GetRxPinConfig<Kvasir::Io::PinLocation<Port, Pin>> {
+                using pad
+                  = decltype(write(Regs::CTRLA::rxpo,
+                                   fieldValue<decltype(Regs::CTRLA::rxpo),
+                                              Sam::Package::Sercom::getPOVal<SercomInstance>(
+                                                Io::PinLocation<Port, Pin>{})>()));
                 using enable    = decltype(set(Regs::CTRLB::rxen));
-                using pinConfig = decltype(action(
-                  Kvasir::Io::Action::PinFunction<Traits::SercomTraits::GetPinFunction<
-                    SercomInstance>(Register::PinLocation<Port, Pin>{})>{},
-                  Register::PinLocation<Port, Pin>{}));
+                using PinConfig = Sam::
+                  PinFunctionOf<Sam::Package::Sercom, SercomInstance, Io::PinLocation<Port, Pin>>;
                 using interrupt = brigand::list<decltype(set(Regs::INTENSET::rxc)),
                                                 decltype(set(Regs::INTENSET::error))>;
                 template<typename InterruptIndex>
-                using interruptEnable = decltype(Kvasir::Nvic::makeEnable(InterruptIndex{}));
+                using InterruptEnable = decltype(Kvasir::Nvic::makeEnable(InterruptIndex{}));
             };
 
             template<typename TXPIN>
             struct GetTxPinConfig;
 
-            template<typename dummy>
-            struct GetTxPinConfig<NotUsed<dummy>> {
-                using pad       = decltype(write(Regs::CTRLA::txpo, Register::value<0>()));
+            template<typename Dummy>
+            struct GetTxPinConfig<Io::NotUsed<Dummy>> {
+                using pad       = decltype(write(Regs::CTRLA::txpo,
+                                                 fieldValue<decltype(Regs::CTRLA::txpo), 0>()));
                 using enable    = decltype(clear(Regs::CTRLB::txen));
-                using pinConfig = brigand::list<>;
+                using PinConfig = brigand::list<>;
             };
 
             template<int Port, int Pin>
-            struct GetTxPinConfig<Kvasir::Register::PinLocation<Port, Pin>> {
-                using pad       = decltype(write(
-                  Regs::CTRLA::txpo,
-                  Register::value<GetTxPadValue(Register::PinLocation<Port, Pin>{})>()));
+            struct GetTxPinConfig<Kvasir::Io::PinLocation<Port, Pin>> {
+                using pad
+                  = decltype(write(Regs::CTRLA::txpo,
+                                   fieldValue<decltype(Regs::CTRLA::txpo),
+                                              getTxPadValue(Io::PinLocation<Port, Pin>{})>()));
                 using enable    = decltype(set(Regs::CTRLB::txen));
-                using pinConfig = decltype(action(
-                  Kvasir::Io::Action::PinFunction<Traits::SercomTraits::GetPinFunction<
-                    SercomInstance>(Register::PinLocation<Port, Pin>{})>{},
-                  Register::PinLocation<Port, Pin>{}));
+                using PinConfig = Sam::
+                  PinFunctionOf<Sam::Package::Sercom, SercomInstance, Io::PinLocation<Port, Pin>>;
             };
 
-            template<DataBits dbits>
+            template<Hal::Uart::DataBits Dbits>
             struct GetDataBitConfig {
                 static constexpr auto config_ = []() {
-                    if constexpr(dbits == DataBits::_5) {
+                    if constexpr(Dbits == Hal::Uart::DataBits::bits5) {
                         return write(Regs::CTRLB::CHSIZEValC::_5_bit);
-                    } else if constexpr(dbits == DataBits::_6) {
+                    } else if constexpr(Dbits == Hal::Uart::DataBits::bits6) {
                         return write(Regs::CTRLB::CHSIZEValC::_6_bit);
-                    } else if constexpr(dbits == DataBits::_7) {
+                    } else if constexpr(Dbits == Hal::Uart::DataBits::bits7) {
                         return write(Regs::CTRLB::CHSIZEValC::_7_bit);
-                    } else if constexpr(dbits == DataBits::_8) {
+                    } else if constexpr(Dbits == Hal::Uart::DataBits::bits8) {
                         return write(Regs::CTRLB::CHSIZEValC::_8_bit);
-                    } else if constexpr(dbits == DataBits::_9) {
+                    } else if constexpr(Dbits == Hal::Uart::DataBits::bits9) {
                         return write(Regs::CTRLB::CHSIZEValC::_9_bit);
                     }
                 }();
                 using config = decltype(config_);
             };
 
-            template<StopBits sbits>
+            template<Hal::Uart::StopBits Sbits>
             struct GetStopBitConfig {
                 static constexpr auto config_ = []() {
-                    if constexpr(sbits == StopBits::_1) {
+                    if constexpr(Sbits == Hal::Uart::StopBits::stop1) {
                         return clear(Regs::CTRLB::sbmode);
-                    } else if constexpr(sbits == StopBits::_2) {
+                    } else if constexpr(Sbits == Hal::Uart::StopBits::stop2) {
                         return set(Regs::CTRLB::sbmode);
                     }
                 }();
                 using config = decltype(config_);
             };
 
-            template<Parity pa>
+            template<Hal::Uart::Parity Pa>
             struct GetParityConfig {
                 static constexpr auto config_ = []() {
-                    if constexpr(pa == Parity::none) {
-                        return brigand::list<decltype(write(Regs::CTRLA::form,
-                                                            Register::value<0>())),
+                    if constexpr(Pa == Hal::Uart::Parity::none) {
+                        return brigand::list<decltype(write(
+                                               Regs::CTRLA::form,
+                                               fieldValue<decltype(Regs::CTRLA::form), 0>())),
                                              decltype(clear(Regs::CTRLB::pmode))>{};
-                    } else if constexpr(pa == Parity::odd) {
-                        return brigand::list<decltype(write(Regs::CTRLA::form,
-                                                            Register::value<1>())),
+                    } else if constexpr(Pa == Hal::Uart::Parity::odd) {
+                        return brigand::list<decltype(write(
+                                               Regs::CTRLA::form,
+                                               fieldValue<decltype(Regs::CTRLA::form), 1>())),
                                              decltype(set(Regs::CTRLB::pmode))>{};
-                    } else if constexpr(pa == Parity::even) {
-                        return brigand::list<decltype(write(Regs::CTRLA::form,
-                                                            Register::value<1>())),
+                    } else if constexpr(Pa == Hal::Uart::Parity::even) {
+                        return brigand::list<decltype(write(
+                                               Regs::CTRLA::form,
+                                               fieldValue<decltype(Regs::CTRLA::form), 1>())),
                                              decltype(clear(Regs::CTRLB::pmode))>{};
                     }
                 }();
@@ -228,68 +167,42 @@ namespace Kvasir { namespace Sercom { namespace Usart {
             };
         };
 
-        // Arithmetic mode, 16 samples per bit: f_baud = f_ref / 16 x (1 - BAUD / 65536), BAUD 16
-        // bits (SAM D21 DS40001882L 25.6.2.3 Table 25-2; SAM C20/C21 Table 30-2; SAM D5x/E5x
-        // Table 33-2). As a multiplier: f_baud = f_ref x n / 2^20 with n = 65536 - BAUD, 1..65536.
-        static constexpr Prescaler::Multiplier ArithmeticBaud{.first = 1,
-                                                              .last  = 65536,
-                                                              .den   = std::uint64_t{1} << 20};
-
-        // the nearest BAUD; on a tie the larger BAUD (the slower rate), as round-half-up gave it
-        constexpr auto baudDivider(std::uint32_t f_clockSpeed,
-                                   std::uint32_t f_baud) {
-            return Prescaler::fromMultiplier(f_clockSpeed, f_baud, ArithmeticBaud);
-        }
-
-        constexpr std::uint32_t calcBaudReg(std::uint32_t f_clockSpeed,
-                                            std::uint32_t f_baud) {
-            return 65536U - baudDivider(f_clockSpeed, f_baud).setting;
-        }
-
     }   // namespace Detail
 
     template<typename UsartConfig_>
     struct UsartBase {
         struct UsartConfig : UsartConfig_ {
-            static constexpr auto userConfigOverride = [] {
-                if constexpr(requires { UsartConfig_::userConfigOverride; }) {
-                    return UsartConfig_::userConfigOverride;
-                } else {
-                    return brigand::list<>{};
-                }
-            }();
+            static constexpr auto userConfigOverride
+              = KVASIR_CONFIG_OR(UsartConfig_, userConfigOverride, brigand::list<>{});
 
-            static constexpr auto maxBaudRateError = [] {
-                if constexpr(requires { UsartConfig_::maxBaudRateError; }) {
-                    return UsartConfig_::maxBaudRateError;
-                } else {
-                    return std::ratio<5, 1000>{};
-                }
-            }();
+            static constexpr auto maxBaudRateError
+              = KVASIR_CONFIG_OR(UsartConfig_, maxBaudRateError, std::ratio<5, 1000>{});
+
+            // loop-back through the pad: rxPinLocation is the txPinLocation, RXPO names its pad
+            // (SercomPads.hpp receivePinFits)
+            static constexpr bool loopBack = KVASIR_CONFIG_OR(UsartConfig_, loopBack, false);
         };
 
-        // needed config
-        // clockSpeed
-        // baudRate
-        // usartInstance
-        // txPinLocation
-        // rxPinLocation
-        // userConfigOverride
-        // dataBits
-        // parity
-        // stopBits
-        static constexpr auto Instance = UsartConfig::instance;
-        using Regs                     = Kvasir::Peripheral::SERCOM_USART::Registers<Instance>;
+        // needed config: clockSpeed, baudRate, instance, txPinLocation, rxPinLocation (Io::NotUsed<>: send only),
+        // dataBits, parity, stopBits; optional (above): userConfigOverride, maxBaudRateError, loopBack
+        static constexpr auto instance = UsartConfig::instance;
+        using Regs                     = Sam::Package::SercomUsart<instance>;
 
-        using InterruptIndexs = decltype(Traits::SercomTraits::getSercomIsrIndexs<Instance>());
+        // Startup: this SERCOM (one owner across I2C/SPI/USART - the three register views share
+        // the base address) and the core clock BAUD is computed from (Clocks.hpp: the
+        // ClockSettings must route a generator at clockSpeed to GCLK_SERCOMn_CORE and provide it).
+        using Provides = brigand::list<Hal::Owns<Regs>>;
+        using Claims   = Hal::Claim<Clocks::ClkSercomCore<instance>, UsartConfig::clockSpeed>;
 
-        using Config = Detail::Config<Instance>;
+        using InterruptIndexs = decltype(Sam::Block<Regs>::irqs());
 
-        static constexpr auto RxDmaTrigger = Traits::SercomTraits::DmaRX_Trigger<Instance>();
-        static constexpr auto TxDmaTrigger = Traits::SercomTraits::DmaTX_Trigger<Instance>();
+        using Config = Detail::Config<instance>;
+
+        static constexpr auto rxDmaTrigger = Sam::Block<Regs>::dmaRx();
+        static constexpr auto txDmaTrigger = Sam::Block<Regs>::dmaTx();
 
         // the achieved baud rate against maxBaudRateError; a failure prints wanted, got and ppm
-        static constexpr bool BaudInTolerance = [] {
+        static constexpr bool baudInTolerance = [] {
             Prescaler::assertInTolerance<
               Detail::baudDivider(UsartConfig::clockSpeed, UsartConfig::baudRate).achieved,
               UsartConfig::baudRate,
@@ -299,23 +212,27 @@ namespace Kvasir { namespace Sercom { namespace Usart {
         }();
         // a static data member of a class template is initialised only when used: this use is
         // what runs the check
-        static_assert(BaudInTolerance);
+        static_assert(baudInTolerance);
         static_assert(Config::isValidPinLocationTX(UsartConfig::txPinLocation),
                       "invalid TXPin");
         static_assert(Config::isValidPinLocationRX(UsartConfig::rxPinLocation),
                       "invalid RXPin");
-        static_assert(!Config::PinLocationAreTheSame(UsartConfig::txPinLocation,
-                                                     UsartConfig::rxPinLocation),
-                      "TX and RX are the same pin");
+        static_assert(
+          Sam::Pads::checkReceivePin<UsartConfig::loopBack,
+                                     std::remove_cvref_t<decltype(UsartConfig::rxPinLocation)>,
+                                     std::remove_cvref_t<decltype(UsartConfig::txPinLocation)>,
+                                     "USART rxPinLocation/txPinLocation">());
 
         static constexpr auto powerClockEnable
-          = list(typename PM::enable<Regs::baseAddr>::action{});
+          = list(typename PM::Enable<Regs::baseAddr>::action{});
 
-        static constexpr auto initStepPinConfig
-          = list(typename Config::template GetTxPinConfig<
-                   std::decay_t<decltype(UsartConfig::txPinLocation)>>::pinConfig{},
-                 typename Config::template GetRxPinConfig<
-                   std::decay_t<decltype(UsartConfig::rxPinLocation)>>::pinConfig{});
+        static constexpr auto initStepPinConfig = list(
+          typename Config::template GetTxPinConfig<
+            std::decay_t<decltype(UsartConfig::txPinLocation)>>::PinConfig{},
+          std::conditional_t<UsartConfig::loopBack,   // loop-back: the TX pin, configured once
+                             brigand::list<>,
+                             typename Config::template GetRxPinConfig<
+                               std::decay_t<decltype(UsartConfig::rxPinLocation)>>::PinConfig>{});
 
         static constexpr auto initStepPeripheryConfig = list(
           typename Config::template GetTxPinConfig<
@@ -363,7 +280,7 @@ namespace Kvasir { namespace Sercom { namespace Usart {
         static constexpr auto initStepPeripheryEnable = list(
           set(Regs::CTRLA::enable),
           typename Config::template GetRxPinConfig<std::decay_t<
-            decltype(UsartConfig::rxPinLocation)>>::template interruptEnable<InterruptIndexs>{});
+            decltype(UsartConfig::rxPinLocation)>>::template InterruptEnable<InterruptIndexs>{});
 
         // CTRLA.ENABLE is write-synchronized and SYNCBUSY.ENABLE clears when the enable is done (D21 DS40001882L
         // 26.6.6, 14.3.2.5); what a DATA write during that time does is not stated, so nothing is sent before
@@ -374,100 +291,167 @@ namespace Kvasir { namespace Sercom { namespace Usart {
         }
     };
 
+    // A transmit that never finishes - the SERCOM or the DMAC reset or disabled under it, a descriptor lost - is
+    // given up after twice its time on the wire plus 1 ms (txTimeout(), on TimeClock): the channel stopped, the bytes
+    // the caller's again, the SERCOM set up again if it was reset (CTRLA.SWRST "resets all registers ... and the
+    // peripheral is disabled", D21 DS40001882L 26.6.2.2, md l.19309), the DMAC set up again if it is off;
+    // operationState() then says `failed` until the next send(), and the next send() starts afresh. txTimeouts()
+    // counts them. Nothing waits for a person or a reset.
     template<typename UartConfig,
+             typename TimeClock,
              typename Dma,
              DMAC::DMAChannel  DmaChannel,
              DMAC::DMAPriority DmaPriority,
              std::size_t       BufferSize>
     struct UartBehaviorImpl : Kvasir::Sercom::Usart::UsartBase<UartConfig> {
-        using base                           = Kvasir::Sercom::Usart::UsartBase<UartConfig>;
-        using Regs                           = typename base::Regs;
-        using DmaRegs                        = typename Dma::Regs;
-        static constexpr std::size_t DmaChId = std::size_t(DmaChannel);
-        static constexpr std::size_t DmaLvl  = std::size_t(DmaPriority);
+        using base = Kvasir::Sercom::Usart::UsartBase<UartConfig>;
+        using Regs = typename base::Regs;
 
-        static_assert(Dma::numberOfChannels > DmaChId);
+        static_assert(Dma::numberOfChannels > std::size_t(DmaChannel));
 
-        inline static Kvasir::Atomic::Queue<std::optional<std::byte>, BufferSize> rxbuffer_{};
+        using Claims = brigand::append<typename base::Claims, DMAC::Claims<Dma, DmaChannel>>;
 
         enum class OperationState { succeeded, failed, ongoing };
 
-        inline static bool b = false;
+        /// One character on the wire: the start bit, the data bits, the parity bit, the stop bits.
+        static constexpr std::uint32_t bitsPerCharacter
+          = 1U + 5U + static_cast<std::uint32_t>(UartConfig::dataBits)
+          + (UartConfig::parity == Hal::Uart::Parity::none ? 0U : 1U)
+          + (UartConfig::stopBits == Hal::Uart::StopBits::stop2 ? 2U : 1U);
 
-        // inline static std::atomic<OperationState> operationState_ = OperationState::succeeded;
+        /// How long a transmit of `bytes` may take before it counts as stuck: twice its time on the wire, plus 1 ms
+        /// for the DMAC's start and the clock's tick.
+        static constexpr std::chrono::microseconds txTimeout(std::size_t bytes) {
+            return std::chrono::microseconds{2ULL * bytes * bitsPerCharacter * 1'000'000ULL
+                                               / static_cast<std::uint64_t>(UartConfig::baudRate)
+                                             + 1'000ULL};
+        }
+
         static OperationState operationState() {
-            if(!b) { return OperationState::succeeded; }
+            if(state_ != OperationState::ongoing) { return state_; }
             if(!Dma::template wd<DmaChannel>().isValid() && apply(read(Regs::INTFLAG::txc))) {
-                b = false;
-                return OperationState::succeeded;
+                // the bytes are the caller's again (Kvasir/Hal/DmaHandoff.hpp)
+                Hal::takeFromHardware();
+                state_ = OperationState::succeeded;
+                return state_;
             }
-            // TODO timeout
-            return OperationState::ongoing;
+            if(TimeClock::now() < deadline_) { return OperationState::ongoing; }
+            abandon();
+            return state_;
         }
 
-        static void startDma() {
-            apply(Dma::template start<DmaChannel, DmaPriority, base::TxDmaTrigger>());
-            b = true;   // TODO
+        /// Transmits given up since boot (header comment above).
+        [[nodiscard]] static std::uint32_t txTimeouts() { return txTimeouts_; }
+
+    private:
+        inline static OperationState                 state_{OperationState::succeeded};
+        inline static typename TimeClock::time_point deadline_{};
+        inline static std::uint32_t volatile txTimeouts_{};
+
+        static void abandon() {
+            static_cast<void>(
+              Dma::template stopAndWait<DmaChannel>());   // takes the bytes back itself
+            // the DMAC reset or disabled under it: its descriptor bases and enable again (DmaBase::runtimeInit)
+            if(apply(read(Dma::Regs::CTRL::dmaenable)) == 0) { Dma::runtimeInit(); }
+            // the SERCOM reset or disabled under it: Startup's steps again, after a reset still running (SYNCBUSY.SWRST)
+            if(apply(read(Regs::CTRLA::enable)) == 0) {
+                static_cast<void>(
+                  Register::waitUntil<Kvasir::Chip::Sam::SyncBound, Register::OnTimeout::Report>(
+                    Register::isClear(Regs::SYNCBUSY::swrst)));
+                apply(base::initStepPeripheryConfig);
+                apply(base::initStepPeripheryEnable);
+                base::runtimeInit();
+            }
+            txTimeouts_ = txTimeouts_ + 1;
+            state_      = OperationState::failed;
         }
 
+        static void startDma(std::size_t bytes) {
+            deadline_ = TimeClock::now()
+                      + std::chrono::ceil<typename TimeClock::duration>(txTimeout(bytes)) +
+                        typename TimeClock::duration{1};   // the tick in progress
+            // the descriptor and the bytes are the DMAC's from here
+            Hal::handToHardware();
+            apply(Dma::template start<DmaChannel, DmaPriority, base::txDmaTrigger>());
+            state_ = OperationState::ongoing;
+        }
+
+    public:
         template<typename C>
-        static void send_nocopy(C const& c) {
-            send_nocopy(c.begin(), c.end());
+        static void sendNocopy(C const& c) {
+            sendNocopy(c.begin(), c.end());
         }
 
         template<typename InputIt>
-        static void send_nocopy(InputIt first,
-                                InputIt last) {
+        static void sendNocopy(InputIt first,
+                               InputIt last) {
             static_assert(sizeof(*first) == 1, "only bytes");
-            Dma::template rd<DmaChannel>()
-              = DMAC::DmacDescriptor(true,
-                                     DMAC::DmacDescriptor::stepsize::x1,
-                                     DMAC::DmacDescriptor::stepsel::src,
-                                     DMAC::DmacDescriptor::dstinc::no_increment,
-                                     DMAC::DmacDescriptor::srcinc::increment,
-                                     DMAC::DmacDescriptor::beatsize::byte,
-                                     DMAC::DmacDescriptor::blockact::noact,
-                                     DMAC::DmacDescriptor::evosel::disabled,
-                                     std::uint16_t(std::distance(first, last)),
-                                     // to_address: a container's iterator need not be a pointer
-                                     reinterpret_cast<std::uint32_t>(std::to_address(last)),
-                                     Regs::DATA8::Addr::value);
-            // set timeout
-            startDma();
+            Dma::template rd<DmaChannel>() = DMAC::DmacDescriptor{
+              {.stepSel = DMAC::DmacDescriptor::Stepsel::src,
+               .srcInc  = DMAC::DmacDescriptor::Srcinc::increment,
+               .count   = std::uint16_t(std::distance(first, last)),
+               // to_address: a container's iterator need not be a pointer
+               .src = reinterpret_cast<std::uint32_t>(std::to_address(last)),
+               .dst = Regs::DATA8::Addr::value}
+            };
+            startDma(static_cast<std::size_t>(std::distance(first, last)));
         }
 
-        /* template<typename C>
-            static void send(C const& c) {
-            // TODO copy to DMA buffer
-         }*/
+        /// Hal::Uart::ByteSource (kvasir/Hal/Uart.hpp): the next received byte, if one is
+        /// waiting; an empty optional inside `out` is a frame error the interrupt recorded.
+        static bool receive(std::optional<std::byte>& out) { return rxbuffer_.popInto(out); }
+
+        /// Hal::Uart::ByteSink: all of `s` while nothing is on the way, else nothing (an empty `s`
+        /// starts no transfer). No copy: the bytes stay the caller's until txIdle().
+        static std::size_t send(std::span<std::byte const> s) {
+            if(s.empty() || operationState() == OperationState::ongoing) { return 0; }
+            sendNocopy(s.begin(), s.end());
+            return s.size();
+        }
+
+        /// The DMA's descriptor is done and INTFLAG.TXC says the whole frame, stop bits included,
+        /// has left the shift register with nothing new in DATA (SAM D21 DS40001882 26.6.2.5).
+        [[nodiscard]] static bool txIdle() { return operationState() != OperationState::ongoing; }
+
+    protected:
+        // BufferSize 0 = a send-only UART: no receive queue (a Queue needs at least one slot), receive() finds nothing
+        struct NoRxBuffer {
+            static bool popInto(std::optional<std::byte>&) { return false; }
+
+            static void push(std::optional<std::byte>) {}
+        };
+
+        // filled by the receive interrupt (UartBehavior::onIsr)
+        inline static std::conditional_t<
+          BufferSize == 0,
+          NoRxBuffer,
+          Kvasir::Atomic::Queue<std::optional<std::byte>, BufferSize>>
+          rxbuffer_{};
     };
 
+    /// A SERCOM USART: receive interrupt into a queue of BufferSize (0: send only), transmit by DMA on DmaChannel,
+    /// given up after its timeout on TimeClock (Clock::now(); the queued I2C master's Clock) - UartBehaviorImpl.
+    /// Its receive half is there when the config names an rxPinLocation (not Io::NotUsed<>): the receive interrupt
+    /// (Isr, an empty list for a send-only UART - Startup installs nothing then) and spuriousInterrupts().
     template<typename UartConfig,
-             typename Dma,
-             DMAC::DMAChannel  DmaChannel,
-             DMAC::DMAPriority DmaPriority,
-             std::size_t       BufferSize,
-             bool              isr>
-    struct UartBehaviorSelector;
-
-    template<typename UartConfig,
-             typename Dma,
-             DMAC::DMAChannel  DmaChannel,
-             DMAC::DMAPriority DmaPriority,
-             std::size_t       BufferSize>
-    struct UartBehaviorSelector<UartConfig, Dma, DmaChannel, DmaPriority, BufferSize, false>
-      : UartBehaviorImpl<UartConfig, Dma, DmaChannel, DmaPriority, BufferSize> {};
-
-    template<typename UartConfig,
+             typename TimeClock,
              typename Dma,
              DMAC::DMAChannel  DmaChannel,
              DMAC::DMAPriority DmaPriority,
              std::size_t       BufferSize>
-    struct UartBehaviorSelector<UartConfig, Dma, DmaChannel, DmaPriority, BufferSize, true>
-      : UartBehaviorImpl<UartConfig, Dma, DmaChannel, DmaPriority, BufferSize> {
-        using base = UartBehaviorImpl<UartConfig, Dma, DmaChannel, DmaPriority, BufferSize>;
+    struct UartBehavior
+      : UartBehaviorImpl<UartConfig, TimeClock, Dma, DmaChannel, DmaPriority, BufferSize> {
+        using base
+          = UartBehaviorImpl<UartConfig, TimeClock, Dma, DmaChannel, DmaPriority, BufferSize>;
         using Regs = typename base::Regs;
 
+        static constexpr bool receives
+          = !std::is_same_v<std::remove_cvref_t<decltype(UartConfig::rxPinLocation)>,
+                            Kvasir::Io::NotUsed<>>;
+
+        // The receive interrupt. Not constrained like spuriousInterrupts(): Isr below names its address in both arms
+        // of the choice, and an address of a function whose constraint fails is an error - a send-only UART simply
+        // never installs it.
         static void onIsr() {
             auto const intflag = apply(read(Regs::INTFLAG::error, Regs::INTFLAG::rxc));
 
@@ -478,32 +462,28 @@ namespace Kvasir { namespace Sercom { namespace Usart {
                 std::byte data = std::byte(apply(read(Regs::DATA8::data)).template get<0>());
                 base::rxbuffer_.push(data);
             } else {
-                assert(false);
+                // Neither ERROR nor RXC: an entry with nothing to do (a spurious or late one). Only these two are
+                // enabled, and reading DATA clears RXC (SAM D21 DS 26.8.7, INTFLAG bit 2): nothing to clear. Class E
+                // (Kvasir_SDK Runtime/Check.hpp): counted, never a panic.
+                spurious_ = spurious_ + 1U;
             }
         }
 
-        template<typename... Ts>
-        static constexpr auto makeIsr(brigand::list<Ts...>) {
-            return brigand::list<
-              Kvasir::Nvic::Isr<std::addressof(onIsr), Nvic::Index<Ts::value>>...>{};
+        /// Receive interrupts that found neither ERROR nor RXC set (onIsr's "nothing to do").
+        [[nodiscard]] static std::uint32_t spuriousInterrupts()
+            requires receives
+        {
+            return spurious_;
         }
 
-        using Isr = decltype(makeIsr(typename base::InterruptIndexs{}));
-    };
+        using Isr
+          = std::conditional_t<receives,
+                               Nvic::IsrsFor<std::addressof(onIsr), typename base::InterruptIndexs>,
+                               brigand::list<>>;
 
-    template<typename UartConfig,
-             typename Dma,
-             DMAC::DMAChannel  DmaChannel,
-             DMAC::DMAPriority DmaPriority,
-             std::size_t       BufferSize>
-    struct UartBehavior
-      : UartBehaviorSelector<
-          UartConfig,
-          Dma,
-          DmaChannel,
-          DmaPriority,
-          BufferSize,
-          !std::is_same_v<std::remove_cvref_t<decltype(UartConfig::rxPinLocation)>,
-                          std::remove_cvref_t<decltype(Kvasir::Sercom::Usart::NotUsed<>{})>>> {};
+    private:
+        // written by onIsr only, read anywhere: one word, volatile for the reader outside the interrupt
+        inline static std::uint32_t volatile spurious_{};
+    };
 
 }}}   // namespace Kvasir::Sercom::Usart
