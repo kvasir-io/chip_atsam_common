@@ -14,8 +14,8 @@ struct Kvasir::Panic::PanicReaction<Kvasir::Tag::User> {
 };
 
 namespace {
-using Kvasir::DmaCrc::detail::Held;
-using Kvasir::DmaCrc::detail::Hold;
+using Kvasir::DmaCrc::Detail::Held;
+using Kvasir::DmaCrc::Detail::Hold;
 using Kvasir::Panic::Cause;
 
 template<typename F>

@@ -62,7 +62,7 @@
 #include <string_view>
 
 namespace Kvasir::USB::Sam {
-namespace detail {
+namespace Detail {
     // One bank of an endpoint descriptor, as the module reads it out of RAM (32.13 "Endpoint
     // Descriptor Structure", 32.14 register summary): ADDR at 0x00, PCKSIZE at 0x04, EXTREG at
     // 0x08, STATUS_BK at 0x0A; 16 bytes per bank, bank 0 (OUT, SETUP) then bank 1 (IN), endpoint
@@ -97,7 +97,7 @@ namespace detail {
     // a Hal::loadHardwareField(). One table: there is one controller, whatever Clock and Config the
     // backend is instantiated with.
     alignas(4) inline EndpointDescriptor descriptorTable[Traits::endpointCount]{};
-}   // namespace detail
+}   // namespace Detail
 
 template<typename Clock, typename ConfigT>
 struct Backend {
@@ -143,7 +143,7 @@ public:
 
         using E = typename Traits::template Endpoint<N>;
 
-        static constexpr bool     isIn = Dir == EndpointDirection::In;
+        static constexpr bool     isIn = Dir == EndpointDirection::in;
         static constexpr unsigned bank = isIn ? 1 : 0;
 
         static_assert(N < Traits::endpointCount,
@@ -155,7 +155,7 @@ public:
         alignas(4) static inline std::array<std::byte,
                                             maxPacketSize> buffer{};
 
-        static auto& bankDescriptor() { return detail::descriptorTable[N].bank[bank]; }
+        static auto& bankDescriptor() { return Detail::descriptorTable[N].bank[bank]; }
 
         static inline std::size_t sentOfCancelled_{};
 
@@ -197,12 +197,12 @@ public:
             auto& b = bankDescriptor();
             // Where the data is, is said when an endpoint is armed - but a SETUP comes unasked,
             // so endpoint 0's OUT bank always points at its buffer.
-            if constexpr(Type == EndpointTransferType::Control && !isIn) {
+            if constexpr(Type == EndpointTransferType::control && !isIn) {
                 b.addr = reinterpret_cast<std::uint32_t>(buffer.data());
             } else {
                 b.addr = 0;
             }
-            b.pcksize  = detail::size64;
+            b.pcksize  = Detail::size64;
             b.extreg   = 0;
             b.statusBk = 0;
             Kvasir::Hal::handToHardware();
@@ -219,7 +219,7 @@ public:
             // The flag is a strobe too (write '1' to clear); then the interrupt. Transfer
             // failures (every NAK is one) and sent STALLs stay off.
             apply(Kvasir::Register::reset(Complete{}));
-            if constexpr(Type == EndpointTransferType::Control && !isIn) {
+            if constexpr(Type == EndpointTransferType::control && !isIn) {
                 apply(set(CompleteEnable{}, E::EPINTENSET::rxstp));
             } else {
                 apply(set(CompleteEnable{}));
@@ -262,7 +262,7 @@ public:
             if(!free[0] || data.size() > maxPacketSize) { return false; }
             std::ranges::copy(data, buffer.begin());
             bankDescriptor().addr    = reinterpret_cast<std::uint32_t>(buffer.data());
-            bankDescriptor().pcksize = detail::size64 | static_cast<std::uint32_t>(data.size());
+            bankDescriptor().pcksize = Detail::size64 | static_cast<std::uint32_t>(data.size());
             Kvasir::Hal::handToHardware();
             apply(set(ReadySet{}));
             return true;
@@ -271,7 +271,7 @@ public:
         // How much one arm carries: bulk IN only. Control transfers stay at a packet (the device
         // runs their stages packet by packet), interrupt ones are a packet by nature.
         static constexpr std::size_t maxTransfer
-          = isIn && Type == EndpointTransferType::Bulk ? configuredMaxTransfer : maxPacketSize;
+          = isIn && Type == EndpointTransferType::bulk ? configuredMaxTransfer : maxPacketSize;
 
         // A whole transfer, read by the module where it is: BYTE_COUNT is its length and
         // MULTI_PACKET_SIZE, the module's count of what has gone out, starts at zero; it sends
@@ -280,7 +280,7 @@ public:
         template<bool Last>
         static bool tryTransferInPlace(std::span<std::byte const> data,
                                        FreeBuffers const&         free)
-            requires(isIn && Type == EndpointTransferType::Bulk)
+            requires(isIn && Type == EndpointTransferType::bulk)
         {
             if(!free[0] || data.size() > maxTransfer
                || reinterpret_cast<std::uintptr_t>(data.data()) % 4 != 0)
@@ -288,7 +288,7 @@ public:
                 return false;
             }
             bankDescriptor().addr    = reinterpret_cast<std::uint32_t>(data.data());
-            bankDescriptor().pcksize = detail::size64 | static_cast<std::uint32_t>(data.size());
+            bankDescriptor().pcksize = Detail::size64 | static_cast<std::uint32_t>(data.size());
             Kvasir::Hal::handToHardware();
             apply(set(ReadySet{}));
             return true;
@@ -296,7 +296,7 @@ public:
 
         // Of the transfer cancel() took back: what MULTI_PACKET_SIZE said had gone out.
         static std::size_t sentOfCancelled()
-            requires(isIn && Type == EndpointTransferType::Bulk)
+            requires(isIn && Type == EndpointTransferType::bulk)
         {
             return sentOfCancelled_;
         }
@@ -310,8 +310,8 @@ public:
             if(withController() || completionPending()) { return false; }
             bankDescriptor().addr = reinterpret_cast<std::uint32_t>(buffer.data());
             bankDescriptor().pcksize
-              = detail::size64
-              | (static_cast<std::uint32_t>(maxPacketSize) << detail::multiPacketPos);
+              = Detail::size64
+              | (static_cast<std::uint32_t>(maxPacketSize) << Detail::multiPacketPos);
             Kvasir::Hal::handToHardware();
             apply(set(ReadyClear{}));
             return true;
@@ -326,10 +326,10 @@ public:
         // TRCPT0; a short packet ends the transfer with one; and behind a short packet's payload
         // the module writes its CRC, up to two bytes, still inside that packet's 64 (32.6.2.7).
         static constexpr std::size_t maxReceive
-          = !isIn && Type == EndpointTransferType::Bulk ? configuredMaxReceive : maxPacketSize;
+          = !isIn && Type == EndpointTransferType::bulk ? configuredMaxReceive : maxPacketSize;
 
         static bool armReceiveInto(std::span<std::byte> dest)
-            requires(!isIn && Type == EndpointTransferType::Bulk)
+            requires(!isIn && Type == EndpointTransferType::bulk)
         {
             if(withController() || completionPending() || dest.empty() || dest.size() > maxReceive
                || dest.size() % maxPacketSize != 0
@@ -339,8 +339,8 @@ public:
             }
             bankDescriptor().addr = reinterpret_cast<std::uint32_t>(dest.data());
             bankDescriptor().pcksize
-              = detail::size64
-              | (static_cast<std::uint32_t>(dest.size()) << detail::multiPacketPos);
+              = Detail::size64
+              | (static_cast<std::uint32_t>(dest.size()) << Detail::multiPacketPos);
             Kvasir::Hal::handToHardware();
             apply(set(ReadyClear{}));
             return true;
@@ -349,16 +349,16 @@ public:
         // in transferComplete (after its takeFromHardware), or polled by takeBackReceive(): one
         // load of the module's count each call
         static std::size_t received()
-            requires(!isIn && Type == EndpointTransferType::Bulk)
+            requires(!isIn && Type == EndpointTransferType::bulk)
         {
-            return Kvasir::Hal::loadHardwareField(bankDescriptor().pcksize) & detail::byteCountMask;
+            return Kvasir::Hal::loadHardwareField(bankDescriptor().pcksize) & Detail::byteCountMask;
         }
 
         // while armed: the module moves it under the caller
         static std::size_t receivedSoFar()
-            requires(!isIn && Type == EndpointTransferType::Bulk)
+            requires(!isIn && Type == EndpointTransferType::bulk)
         {
-            return Kvasir::Hal::loadHardwareField(bankDescriptor().pcksize) & detail::byteCountMask;
+            return Kvasir::Hal::loadHardwareField(bankDescriptor().pcksize) & Detail::byteCountMask;
         }
 
         // Ends the transfer: BK0RDY set makes the module NAK from the next token on. A packet
@@ -369,7 +369,7 @@ public:
         // The cost: the caller holds the USB interrupt (or is in it, for a SET_FEATURE halt) for
         // those 120 us - two packets' time, once per taken-back transfer, not per packet.
         static std::optional<std::size_t> takeBackReceive()
-            requires(!isIn && Type == EndpointTransferType::Bulk)
+            requires(!isIn && Type == EndpointTransferType::bulk)
         {
             static constexpr auto settle = std::chrono::microseconds{120};
             apply(set(ReadySet{}));
@@ -390,7 +390,7 @@ public:
         static std::size_t readCurrentBuffer(std::span<std::byte> dest) {
             static_assert(!isIn, "read only on an OUT endpoint");
             // in transferComplete: dispatchEndpoint took the bank and the buffer back first
-            std::size_t const received = bankDescriptor().pcksize & detail::byteCountMask;
+            std::size_t const received = bankDescriptor().pcksize & Detail::byteCountMask;
             std::size_t const n        = std::min(received, dest.size());
             std::memcpy(dest.data(), buffer.data(), n);
             return n;
@@ -419,7 +419,7 @@ public:
                 // what it sent in MULTI_PACKET_SIZE, a packet at a time (32.6.2.10).
                 sentOfCancelled_
                   = armed && !sent
-                    ? (bankDescriptor().pcksize >> detail::multiPacketPos) & detail::byteCountMask
+                    ? (bankDescriptor().pcksize >> Detail::multiPacketPos) & Detail::byteCountMask
                     : 0;
                 return armed && !sent ? 1 : 0;
             } else {
@@ -430,7 +430,7 @@ public:
     };
 
 private:
-    using Ep0Out = Endpoint<0, EndpointDirection::Out, EndpointTransferType::Control>;
+    using Ep0Out = Endpoint<0, EndpointDirection::out, EndpointTransferType::control>;
 
     template<std::size_t N,
              typename Sink>
@@ -481,7 +481,7 @@ public:
                                       Regs::INTFLAG::suspend,
                                       Regs::INTFLAG::wakeup));
 
-        if constexpr(CfgTraits::UseSof) {
+        if constexpr(CfgTraits::useSof) {
             if(get<0>(flags) != 0) {
                 apply(reset(Regs::INTFLAG::sof));
                 std::uint16_t const frame = apply(read(Regs::FNUM::fnum));
@@ -562,7 +562,7 @@ public:
               write(Regs::PADCAL::transp, cal.transp),
               write(Regs::PADCAL::trim, cal.trim));
 
-        for(auto& descriptor : detail::descriptorTable) {
+        for(auto& descriptor : Detail::descriptorTable) {
             for(auto& b : descriptor.bank) {
                 b.addr     = 0;
                 b.pcksize  = 0;
@@ -572,10 +572,10 @@ public:
         }
         Kvasir::Hal::handToHardware();
         apply(write(Regs::DESCADD::descadd,
-                    reinterpret_cast<std::uint32_t>(std::addressof(detail::descriptorTable[0]))));
+                    reinterpret_cast<std::uint32_t>(std::addressof(Detail::descriptorTable[0]))));
 
         apply(write(Regs::CTRLB::SPDCONFValC::fs));
-        if constexpr(CfgTraits::UseSof) {
+        if constexpr(CfgTraits::useSof) {
             apply(set(Regs::INTENSET::eorst, Regs::INTENSET::suspend, Regs::INTENSET::sof));
         } else {
             apply(set(Regs::INTENSET::eorst, Regs::INTENSET::suspend));
@@ -619,7 +619,7 @@ public:
         std::uint32_t const enabled = apply(read(Regs::CTRLA::enable));
         check(enabled != 0, "the module is enabled", "Usb is not in the Startup list?");
         std::uint32_t const table = apply(read(Regs::DESCADD::descadd));
-        check(table == reinterpret_cast<std::uint32_t>(std::addressof(detail::descriptorTable[0])),
+        check(table == reinterpret_cast<std::uint32_t>(std::addressof(Detail::descriptorTable[0])),
               "DESCADD points at the endpoint descriptor table",
               "prepare() did not get that far");
         std::uint32_t const detached = apply(read(Regs::CTRLB::detach));

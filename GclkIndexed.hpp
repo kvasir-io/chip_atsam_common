@@ -16,7 +16,7 @@
 #include "peripherals/GCLK.hpp"
 
 namespace Kvasir { namespace Sam { namespace Gclk {
-    namespace detail {
+    namespace Detail {
         // A warning, not an error: what the silicon does with a division above the maximum factor is unmeasured (the
         // chip's ClockLimits cites its table). The note names Generator and Div.
         template<unsigned           Generator,
@@ -27,7 +27,7 @@ namespace Kvasir { namespace Sam { namespace Gclk {
         constexpr bool divisionAboveTableMaximum() {
             return true;
         }
-    }   // namespace detail
+    }   // namespace Detail
 
     template<unsigned           DivBits,
              unsigned long long MaxDivision,
@@ -51,7 +51,7 @@ namespace Kvasir { namespace Sam { namespace Gclk {
 #ifdef KVASIR_WARN_GCLK_DIVISION
             if constexpr(!divisionInTable) {
                 [[maybe_unused]] constexpr bool warned
-                  = detail::divisionAboveTableMaximum<G, Div>();
+                  = Detail::divisionAboveTableMaximum<G, Div>();
             }
 #endif
             return list(GC::overrideDefaults(

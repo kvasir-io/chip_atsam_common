@@ -47,7 +47,7 @@ namespace Kvasir { namespace EIC {
         levelLow  = 5
     };
 
-    namespace detail {
+    namespace Detail {
         using Regs = Kvasir::Peripheral::EIC::Registers<>;
 
         // One EXTINT bit of INTFLAG / INTENSET, typed as the register's own EXTINT field.
@@ -153,7 +153,7 @@ namespace Kvasir { namespace EIC {
                                                     Pin>) {
             return Traits::extIntOf(Port, Pin);
         }
-    }   // namespace detail
+    }   // namespace Detail
 
     // An EXTINT number: the line that configures it provides it, so a second user of the same
     // line (another pin on that EXTINT, D21 21.6.6 note 2, md 15164: "only one will be active")
@@ -164,7 +164,7 @@ namespace Kvasir { namespace EIC {
     // channel that clocks edge detection and the filter (GCLK_EIC) is the firmware's clock
     // settings' business.
     struct EicBase {
-        using Regs                   = detail::Regs;
+        using Regs                   = Detail::Regs;
         static constexpr unsigned ba = Regs::baseAddr;
 
         static constexpr auto powerClockEnable = list(typename PM::Enable<ba>::action{});
@@ -209,20 +209,20 @@ namespace Kvasir { namespace EIC {
              bool                  Filter = true,
              bool                  Event  = false>
     struct ExtInt {
-        static constexpr unsigned line = detail::extIntOf(Pin{});
+        static constexpr unsigned line = Detail::extIntOf(Pin{});
         static_assert(
-          line != detail::notEncoded,
+          line != Detail::notEncoded,
           "this chip's EXTINT rule does not encode the pad's port (atsam_common/EicLines.hpp)");
-        static_assert(line != detail::noExtInt,
+        static_assert(line != Detail::noExtInt,
                       "the pad drives no EXTINT line (PA08 is the NMI pin)");
         static_assert(Priority >= 0,
                       "an EXTINT line needs its NVIC priority");
 
-        using Regs   = detail::Regs;
+        using Regs   = Detail::Regs;
         using Vector = Kvasir::Sam::Package::EicVector<line>;
 
-        static constexpr detail::ExtIntBit<line, typename Regs::INTFLAG>  flag{};
-        static constexpr detail::ExtIntBit<line, typename Regs::INTENSET> enable{};
+        static constexpr Detail::ExtIntBit<line, typename Regs::INTFLAG>  flag{};
+        static constexpr Detail::ExtIntBit<line, typename Regs::INTENSET> enable{};
 
         // the line is this entry's; the EIC has to be enabled by an EicBase in the list
         using Provides = brigand::list<Startup::Resource<ExtIntLineTag, line>>;
@@ -244,9 +244,9 @@ namespace Kvasir { namespace EIC {
                         Pin{}));
 
         static constexpr auto initStepPeripheryConfig
-          = list(detail::CONFIG<line, Regs::CONFIG>::template setInterruptType<Type>(),
-                 detail::CONFIG<line, Regs::CONFIG>::template setFilter<Filter>(),
-                 detail::EVCTRL<line, typename Regs::EVCTRL>::template setEvent<Event>());
+          = list(Detail::CONFIG<line, Regs::CONFIG>::template setInterruptType<Type>(),
+                 Detail::CONFIG<line, Regs::CONFIG>::template setFilter<Filter>(),
+                 Detail::EVCTRL<line, typename Regs::EVCTRL>::template setEvent<Event>());
     };
 
     // The pull of an EXTINT helper's pins (SamPushButton, SamRotaryEncoder, SamQuadratureEncoder): PullUp unless the

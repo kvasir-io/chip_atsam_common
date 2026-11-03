@@ -56,7 +56,7 @@ namespace Kvasir {
 // taken) -, so each such write is followed by a DSB and that many NOPs (DmacCrcModes.hpp crcDataInPace, host-tested).
 namespace DmaCrc {
 
-    namespace detail {
+    namespace Detail {
         // Off. CRCBUSY first, written 1 (the I/O interface's end): with it set the D21/C21 do not turn the CRC off
         // ("Writing a '0' to this bit will disable the CRC calculation when the CRC Status Busy flag is cleared", D21
         // 20.8.1 md l.13389, C21 25.8.1 md l.16281), and the E5x keeps CRCSRC locked ("the CRCSRC cannot be modified
@@ -148,7 +148,7 @@ namespace DmaCrc {
               Kvasir::Register::get<0>(apply(read(CRC::CRCCHKSUM::crcchksum32))));
             return checksumOf<Type>(sum, busy);
         }
-    }   // namespace detail
+    }   // namespace Detail
 
     template<CrcType Crc,
              typename It>
@@ -163,9 +163,9 @@ namespace DmaCrc {
                                std::uint8_t,
                                std::conditional_t<dataSize == 2, std::uint16_t, std::uint32_t>>;
 
-        detail::Held const hold{};
-        detail::start<Crc, dataSize, 0xFFFF'FFFFU>();
-        for(; start != end; ++start) { detail::put(static_cast<Data>(*start)); }
+        Detail::Held const hold{};
+        Detail::start<Crc, dataSize, 0xFFFF'FFFFU>();
+        for(; start != end; ++start) { Detail::put(static_cast<Data>(*start)); }
         // the generation complete (CRCBUSY written 1, the I/O interface's end), then the checksum as the engine gives it
         apply(set(CRC::CRCSTATUS::crcbusy));
         return static_cast<std::conditional_t<Crc == CrcType::crc16, std::uint16_t, std::uint32_t>>(
@@ -193,19 +193,19 @@ namespace DmaCrc {
         using value_type             = std::remove_cvref_t<decltype(P.poly)>;
         static constexpr auto params = P;
 
-        DmacEngine() { detail::start<type, 1, dmacSeedFor<P>()>(); }
+        DmacEngine() { Detail::start<type, 1, dmacSeedFor<P>()>(); }
 
         DmacEngine(DmacEngine const&)            = delete;
         DmacEngine& operator=(DmacEngine const&) = delete;
 
         DmacEngine& update(std::span<std::byte const> data) {
-            for(auto const b : data) { detail::put(std::to_integer<std::uint8_t>(b)); }
+            for(auto const b : data) { Detail::put(std::to_integer<std::uint8_t>(b)); }
             return *this;
         }
 
         /// The CRC of everything so far; update() may go on.
         [[nodiscard]] value_type finish() const {
-            return static_cast<value_type>(detail::current<type>());
+            return static_cast<value_type>(Detail::current<type>());
         }
 
         [[nodiscard]] static value_type compute(std::span<std::byte const> data) {
@@ -214,7 +214,7 @@ namespace DmaCrc {
 
     private:
         // the only member: taken before the constructor starts the engine, given when the engine goes
-        [[no_unique_address]] detail::Held hold_{};
+        [[no_unique_address]] Detail::Held hold_{};
     };
 
     /// The `type` + `calc(span)` shape (Kvasir::Crc::Calc's) over the DMAC's CRC engine: DmacEngine<P>::compute.

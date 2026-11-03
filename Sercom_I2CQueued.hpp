@@ -72,10 +72,10 @@ namespace Kvasir { namespace Sercom { namespace I2C {
             /// The SERCOM's half of the queued master (kvasir_devices I2C/Controller/QueueHw.hpp).
             struct Hw {
                 static constexpr auto instance       = base::instance;
-                static constexpr bool cancellable    = Shape::Cancellable;
-                static constexpr bool deadlines      = Shape::Deadlines;
-                static constexpr bool perDeviceClock = Shape::PerDeviceClock;
-                static constexpr auto busFeatures    = Shape::BusFeatures;
+                static constexpr bool cancellable    = Shape::cancellable;
+                static constexpr bool deadlines      = Shape::deadlines;
+                static constexpr bool perDeviceClock = Shape::perDeviceClock;
+                static constexpr auto busFeatures    = Shape::busFeatures;
                 using Recovery                       = I2CQueuedHalf::Recovery;
                 using Request                        = typename Shape::Request;
                 using Snapshot                       = I2CQueuedHalf::Snapshot;
@@ -236,7 +236,7 @@ namespace Kvasir { namespace Sercom { namespace I2C {
 
                     // our own stop (cancel, deadline), taken at this byte boundary: NACK + STOP, not a fault. A NAK or
                     // a bus error that came first keeps its own result (below).
-                    if constexpr(Shape::Tracked) {
+                    if constexpr(Shape::tracked) {
                         if(Core::cancelPending_ && !error && !rxnack && (mb || sb)) {
                             apply(nackStop);
                             Core::complete(Core::stopAs_);

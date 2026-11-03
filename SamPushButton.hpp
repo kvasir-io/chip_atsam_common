@@ -6,7 +6,7 @@
 #include <cstddef>
 
 namespace Kvasir {
-namespace detail {
+namespace Detail {
     /// A button's Startup share. Edge mode: its EXTINT line (pin, sense, filter) and its share of the
     /// EIC interrupt.
     template<bool Debounced, typename Pin, auto EdgeCallback, typename Config>
@@ -21,7 +21,7 @@ namespace detail {
         static constexpr auto initStepPinConfig
           = list(action(Io::Action::Input<EIC::pullOf<Config>>{}, Pin{}));
     };
-}   // namespace detail
+}   // namespace Detail
 
 /// A PushButton on a SAM pin, pull-up by default (Config_::pull to change it, EIC::pullOf). Listing it
 /// in Startup is all it takes.
@@ -35,7 +35,7 @@ namespace detail {
 template<typename Clock, typename Pin, std::size_t EventQSize, typename Config_>
 struct SamPushButton
   : Kvasir::PushButton<Clock, Pin, EventQSize, Config_>
-  , detail::SamButtonEntry<Kvasir::PushButton<Clock, Pin, EventQSize, Config_>::Config::debounce,
+  , Detail::SamButtonEntry<Kvasir::PushButton<Clock, Pin, EventQSize, Config_>::Config::debounce,
                            Pin,
                            &Kvasir::PushButton<Clock, Pin, EventQSize, Config_>::edgeCallback,
                            Config_> {

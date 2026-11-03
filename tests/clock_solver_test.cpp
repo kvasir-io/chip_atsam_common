@@ -118,7 +118,7 @@ constexpr auto hand = DPLL::checkXosc<L::fine>(8'000'000, 2, 89, 0);
 static_assert(hand.ok() && hand.out.num == 120'000'000 * hand.out.den);
 
 // the tie-break rules one by one
-namespace DD = DPLL::detail;
+namespace DD = DPLL::Detail;
 
 constexpr DPLL::Setting mk(std::uint64_t refNum,
                            std::uint64_t refDen,

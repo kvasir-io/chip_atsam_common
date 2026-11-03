@@ -10,7 +10,7 @@
 
 #include <atomic>
 
-namespace Kvasir::DmaCrc::detail {
+namespace Kvasir::DmaCrc::Detail {
 
 struct Hold {
 #if KVASIR_DCHECK_LEVEL > 0
@@ -54,4 +54,4 @@ struct Held {
     Held& operator=(Held const&) = delete;
 };
 
-}   // namespace Kvasir::DmaCrc::detail
+}   // namespace Kvasir::DmaCrc::Detail

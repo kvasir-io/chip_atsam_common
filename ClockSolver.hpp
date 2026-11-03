@@ -91,7 +91,7 @@ namespace DPLL {
         [[nodiscard]] constexpr bool integerMode() const { return ldrFrac == 0; }
     };
 
-    namespace detail {
+    namespace Detail {
         // a < b as values (a Rational is not reduced, so == on the members is not equality)
         constexpr bool less(Prescaler::Rational a,
                             Prescaler::Rational b) {
@@ -183,7 +183,7 @@ namespace DPLL {
             }
             return best;
         }
-    }   // namespace detail
+    }   // namespace Detail
 
     // A crystal through DPLLCTRLB.DIV. Exact unless a tolerance is given; fractional only when
     // asked.
@@ -200,8 +200,8 @@ namespace DPLL {
             if(Prescaler::below(ref, L.refMin)) { break; }   // falls with DIV
             if(Prescaler::above(ref, L.refMax)) { continue; }
             auto const s
-              = detail::forReference<L>(ref, div, want, tol, allowFractional, maxGclkDiv);
-            if(s.found && detail::better<L>(s, best, want)) { best = s; }
+              = Detail::forReference<L>(ref, div, want, tol, allowFractional, maxGclkDiv);
+            if(s.found && Detail::better<L>(s, best, want)) { best = s; }
         }
         return best;
     }
@@ -216,7 +216,7 @@ namespace DPLL {
                                     std::uint32_t        maxGclkDiv      = 8) {
         Prescaler::Rational const ref{refHz, 1};
         if(Prescaler::below(ref, L.refMin) || Prescaler::above(ref, L.refMax)) { return {}; }
-        return detail::forReference<L>(ref, 0, want, tol, allowFractional, maxGclkDiv);
+        return Detail::forReference<L>(ref, 0, want, tol, allowFractional, maxGclkDiv);
     }
 
     // A setting written by hand, measured against the limits: what it makes and where it breaks
