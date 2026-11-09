@@ -1,6 +1,7 @@
 #pragma once
 
 #include "chip/Io.hpp"
+#include "chip/atsam_common/RegisterSeam.hpp"
 #include "kvasir/Hal/Pins.hpp"
 #include "kvasir/Io/Claims.hpp"
 #include "kvasir/Io/Io.hpp"
@@ -9,6 +10,7 @@
 
 #include <cstdint>
 #include <type_traits>
+#include <utility>
 
 // The SAM pin actions on the generated PORT registers, through the chip's `Sam::PortGroup<Port>` (chip/Io.hpp). DIRCLR,
 // DIRSET, OUTCLR, OUTSET and OUTTGL are marked one-to-clear/-set/-toggle in the chip's SVD ("Writing a '0' to a bit has
@@ -16,6 +18,11 @@
 // PINCFG is written whole by every configuring action (PMUXEN, INEN, PULLEN, DRVSTR; the reserved bits 7 and 5:3 go out
 // 0 - DS40001882L Table 46-4, md l.51430: "always write reserved bits to zero"): one store, no read. PMUX is a nibble of
 // a byte register shared by a pin pair: a read-modify-write.
+//
+// A pin's level is written by makeOutput (OUTCLR), makeOutputInitHigh (OUTSET), a pulled input (its pull's direction)
+// and set/clear/toggle; its direction by makeOutput (DIRSET), makeInput and a pull-less peripheral function (DIRCLR).
+// Two of those registers on one pin in one apply() (one Startup phase) are a compile error naming the pin
+// (RegisterSeam.hpp): the step runs by address, so `makeOutput(pin), set(pin)` would end low.
 //
 // Pin ownership: the PMUXEN write of a pin's configuration in an entry's initStepPinConfig provides
 // `Io::PinResource<Port, Pin>` (every configuring action below writes it exactly once; Startup derives provides from
@@ -120,6 +127,43 @@ namespace Kvasir { namespace Io {
             return static_cast<int>((address - PinLocationTraits<void>::baseAddress) % groupStride
                                     - pincfgBase);
         }
+
+        // RegisterSeam.hpp's literals against the generated PORT: each group's DIRCLR and DIRSET write one state, its
+        // OUTCLR, OUTSET and OUTTGL another, IN and PINCFG none
+        template<typename F>
+        inline constexpr unsigned addressOf = Register::RegisterTraits<FieldOf<F>>::address;
+
+        template<int Port>
+        consteval bool seamStatesMatch() {
+            using G              = Group<Port>;
+            unsigned const dir   = Sam::PortSeam::stateOf(addressOf<decltype(G::dirclr)>);
+            unsigned const out   = Sam::PortSeam::stateOf(addressOf<decltype(G::outclr)>);
+            unsigned const group = PinLocationTraits<void>::baseAddress
+                                 + static_cast<unsigned>(Port) * Sam::PortSeam::groupStride;
+            return dir == group && out == group + Sam::PortSeam::outOffset
+                && Sam::PortSeam::stateOf(addressOf<decltype(G::dirset)>) == dir
+                && Sam::PortSeam::stateOf(addressOf<decltype(G::outset)>) == out
+                && Sam::PortSeam::stateOf(addressOf<decltype(G::outtgl)>) == out
+                && Sam::PortSeam::stateOf(addressOf<decltype(G::in)>) == 0
+                && Sam::PortSeam::stateOf(
+                     Register::RegisterTraits<typename PincfgReg<Port, 0>::Addr>::address)
+                     == 0;
+        }
+
+        template<int... Ports>
+        consteval bool seamStatesMatchAll(std::integer_sequence<int,
+                                                                Ports...>) {
+            return (seamStatesMatch<Ports>() && ...);
+        }
+
+        static_assert(
+          Sam::PortSeam::baseAddress == PinLocationTraits<void>::baseAddress
+            && PinLocationTraits<void>::portBegin == 0
+            && PinLocationTraits<void>::portEnd <= static_cast<int>(Sam::PortSeam::groups)
+            && seamStatesMatchAll(std::make_integer_sequence<int,
+                                                             PinLocationTraits<void>::portEnd>{}),
+          "chip/atsam_common/RegisterSeam.hpp: the PORT's base or register offsets "
+          "differ from the generated PORT registers");
     }   // namespace Detail
 
     template<Io::PullConfiguration PC, int Port, int Pin>
