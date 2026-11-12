@@ -11,6 +11,7 @@
 #include "kvasir/Devices/SPI/QueueCore.hpp"
 #include "kvasir/Devices/SPI/QueuedFront.hpp"
 #include "kvasir/Hal/DmaHandoff.hpp"
+#include "kvasir/Util/BusAddress.hpp"
 
 #include <cstdint>
 #include <string_view>
@@ -116,10 +117,8 @@ namespace Kvasir { namespace Sercom { namespace SPI {
 
                     auto const n = static_cast<std::uint16_t>(t.frames);
                     // Incrementing addresses point past the end (20.10.3, 20.10.4).
-                    auto const rxAddr
-                      = reinterpret_cast<std::uint32_t>(t.rx) + (t.rxIncrement ? n : 0U);
-                    auto const txAddr
-                      = reinterpret_cast<std::uint32_t>(t.tx) + (t.txIncrement ? n : 0U);
+                    auto const rxAddr = Kvasir::busAddress(t.rx) + (t.rxIncrement ? n : 0U);
+                    auto const txAddr = Kvasir::busAddress(t.tx) + (t.txIncrement ? n : 0U);
                     Dma::template rd<RxChannel>() = DMAC::DmacDescriptor{
                       {.dstInc = t.rxIncrement ? DMAC::DmacDescriptor::Dstinc::increment
                                                : DMAC::DmacDescriptor::Dstinc::noIncrement,

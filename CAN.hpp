@@ -19,6 +19,7 @@ static_assert(
 #include "kvasir/Hal/Clocks.hpp"
 #include "kvasir/Hal/Owns.hpp"
 #include "kvasir/Register/Register.hpp"
+#include "kvasir/Util/BusAddress.hpp"
 #include "kvasir/Util/Config.hpp"
 #include "kvasir/Util/Prescaler.hpp"
 #include "kvasir/Util/attributes.hpp"
@@ -241,12 +242,10 @@ namespace Kvasir { namespace CAN {
           ".noInitLowRam")]] static inline std::array<CanFilter, filterSize> filter{};
 
         static void runtimeInit() {
-            std::uint32_t const rx
-              = reinterpret_cast<std::uint32_t>(std::addressof(rxFIFO)) & 0x0000FFFF_u32;
-            std::uint32_t const tx
-              = reinterpret_cast<std::uint32_t>(std::addressof(txFIFO)) & 0x0000FFFF_u32;
+            std::uint32_t const rx = Kvasir::busAddress(std::addressof(rxFIFO)) & 0x0000FFFF_u32;
+            std::uint32_t const tx = Kvasir::busAddress(std::addressof(txFIFO)) & 0x0000FFFF_u32;
             std::uint32_t const filterAddress
-              = reinterpret_cast<std::uint32_t>(std::addressof(filter)) & 0x0000FFFF_u32;
+              = Kvasir::busAddress(std::addressof(filter)) & 0x0000FFFF_u32;
 
             apply(write(Regs::RXF0C::f0sa, rx),
                   write(Regs::RXF0C::f0s, Kvasir::Register::value<rxSize>()));

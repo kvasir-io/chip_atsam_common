@@ -1,12 +1,15 @@
 // DmacDescriptor.hpp: the DMAC transfer descriptor's builder against BTCTRL's bit table (D21 DS40001882L 20.10.1 md
 // l.14588-14681; the C21 and E5x tables are the same bits, DS60001479M 25.10.1, DS60001507N 22.10.1): every field
 // alone at its bits, the word the 11-argument constructor it replaced built (that formula kept here as the oracle,
-// over every value of every field), the defaults, setValid, and the descriptor's 16 bytes in their order.
+// over every value of every field), the defaults, setValid, the addresses (setSource, setDestination, pastEnd, a pointer for memory) and the
+// descriptor's 16 bytes in their order.
 #include "../DmacDescriptor.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <span>
 
 namespace {
 using D = Kvasir::DMAC::DmacDescriptor;
@@ -113,6 +116,37 @@ constexpr bool validToggles() {
 
 static_assert(validToggles());
 
+// setSource / setDestination change one address and nothing else
+constexpr bool addressesAlone() {
+    D d = sample;
+    d.setSource(0x2000'0100U);
+    bool const source = d.srcaddr == 0x2000'0100 && d.dstaddr == 0x4200'0828;
+    d.setDestination(0x2000'0200U);
+    return source && d.srcaddr == 0x2000'0100 && d.dstaddr == 0x2000'0200
+        && d.btctrl == sample.btctrl && d.btcnt == sample.btcnt && d.descaddr == sample.descaddr;
+}
+
+static_assert(addressesAlone());
+
+// Memory as a pointer, no cast at the call (on this host: the address's low 32 bits). pastEnd: an incrementing
+// side's address is the block's end (20.10.3, 20.10.4), in elements of the block's own type.
+bool memoryAddresses() {
+    static std::array<std::uint16_t, 5> block{};
+    auto const                          first = Kvasir::busAddress(block.data());
+    D const                             d{
+      {.srcInc = D::Srcinc::increment,
+       .count  = 5,
+       .src    = D::pastEnd(std::span{block}),
+       .dst    = 0x4200'0828}
+    };
+    D    e{{.src = block.data()}};
+    bool ok = d.srcaddr == static_cast<std::uint32_t>(first + 10U) && e.srcaddr == first;
+    e.setDestination(D::pastEnd(std::span{block}.first(2)));
+    e.setSource(&block[1]);
+    return ok && e.dstaddr == static_cast<std::uint32_t>(first + 4U)
+        && e.srcaddr == static_cast<std::uint32_t>(first + 2U);
+}
+
 // 20.10: BTCTRL 0x00, BTCNT 0x02, SRCADDR 0x04, DSTADDR 0x08, DESCADDR 0x0C; 128-bit aligned (BASEADDR, 20.8.13)
 static_assert(offsetof(D,
                        btctrl)
@@ -137,5 +171,9 @@ int main() {
     std::printf("dmac_descriptor: BTCTRL %#06x, isValid %d\n",
                 unsigned{d.btctrl},
                 d.isValid() ? 1 : 0);
+    if(!memoryAddresses()) {
+        std::printf("dmac_descriptor: memory addresses wrong\n");
+        return 1;
+    }
     return d.isValid() ? 0 : 1;
 }

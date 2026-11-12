@@ -22,6 +22,7 @@
 #include "kvasir/Register/Utility.hpp"
 #include "kvasir/Register/Wait.hpp"
 #include "kvasir/Runtime/Store.hpp"
+#include "kvasir/Util/BusAddress.hpp"
 #include "kvasir/Util/attributes.hpp"
 #include "peripherals/NVMCTRL.hpp"
 
@@ -409,7 +410,7 @@ namespace Nvm {
                 using F             = Flash<PageSize, PagesPerRow>;
                 auto const zeroPage = [](PageStruct* p) {
                     std::array<std::uint32_t, PageSize / 4> const zeros{};
-                    return F::template writePage<A>(reinterpret_cast<std::uint32_t>(p),
+                    return F::template writePage<A>(Kvasir::busAddress(p),
                                                     zeros.data(),
                                                     zeros.data() + zeros.size());
                 };
@@ -423,14 +424,13 @@ namespace Nvm {
                     asm("" : "=m"(newp)::);
 
                     return F::template writePage<A>(
-                      reinterpret_cast<std::uint32_t>(p),
+                      Kvasir::busAddress(p),
                       reinterpret_cast<AliasedWord const*>(&newp),
                       reinterpret_cast<AliasedWord const*>(&newp + 1));
                 };
 
-                auto const clearAll = [] {
-                    return eraseRows<A>(reinterpret_cast<std::uint32_t>(rows.data()), rows.size());
-                };
+                auto const clearAll
+                  = [] { return eraseRows<A>(Kvasir::busAddress(rows.data()), rows.size()); };
 
                 auto const newV{calcVS(EepromEmulator::ramCopy)};
 
@@ -465,10 +465,7 @@ namespace Nvm {
                 }
 
                 if(rowToClear != nullptr) {
-                    if(auto const r = eraseRow<A>(reinterpret_cast<std::uint32_t>(rowToClear)); !r)
-                    {
-                        return r;
-                    }
+                    if(auto const r = eraseRow<A>(Kvasir::busAddress(rowToClear)); !r) { return r; }
                 }
 
                 if(pageToZero != nullptr) { return zeroPage(pageToZero); }
@@ -589,10 +586,7 @@ namespace Nvm {
                     slot = (slot / PagesPerRow + 1) * PagesPerRow % numPages;
                 }
                 if(slot % PagesPerRow == 0) {
-                    if(auto const r
-                       = eraseRow<A>(reinterpret_cast<std::uint32_t>(&storage.pages[slot]));
-                       !r)
-                    {
+                    if(auto const r = eraseRow<A>(Kvasir::busAddress(&storage.pages[slot])); !r) {
                         return r;
                     }
                 }
@@ -607,7 +601,7 @@ namespace Nvm {
                 // the sequence is used up either way: a failed page may hold it, and is never written over
                 sequence = r.payload.sequence;
                 if(auto const w = Flash<PageSize, PagesPerRow>::template writePage<A>(
-                     reinterpret_cast<std::uint32_t>(&storage.pages[slot]),
+                     Kvasir::busAddress(&storage.pages[slot]),
                      reinterpret_cast<AliasedWord const*>(&r),
                      reinterpret_cast<AliasedWord const*>(&r + 1));
                    !w)

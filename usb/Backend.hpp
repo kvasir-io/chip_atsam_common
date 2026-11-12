@@ -44,6 +44,7 @@
 #include "chip/WaitBounds.hpp"
 #include "kvasir/Hal/DmaHandoff.hpp"
 #include "kvasir/Hal/Owns.hpp"
+#include "kvasir/Util/BusAddress.hpp"
 #include "kvasir/Util/Config.hpp"
 
 #include <algorithm>
@@ -198,7 +199,7 @@ public:
             // Where the data is, is said when an endpoint is armed - but a SETUP comes unasked,
             // so endpoint 0's OUT bank always points at its buffer.
             if constexpr(Type == EndpointTransferType::control && !isIn) {
-                b.addr = reinterpret_cast<std::uint32_t>(buffer.data());
+                b.addr = Kvasir::busAddress(buffer.data());
             } else {
                 b.addr = 0;
             }
@@ -261,7 +262,7 @@ public:
             static_assert(isIn, "tryTransfer is the IN side");
             if(!free[0] || data.size() > maxPacketSize) { return false; }
             std::ranges::copy(data, buffer.begin());
-            bankDescriptor().addr    = reinterpret_cast<std::uint32_t>(buffer.data());
+            bankDescriptor().addr    = Kvasir::busAddress(buffer.data());
             bankDescriptor().pcksize = Detail::size64 | static_cast<std::uint32_t>(data.size());
             Kvasir::Hal::handToHardware();
             apply(set(ReadySet{}));
@@ -287,7 +288,7 @@ public:
             {
                 return false;
             }
-            bankDescriptor().addr    = reinterpret_cast<std::uint32_t>(data.data());
+            bankDescriptor().addr    = Kvasir::busAddress(data.data());
             bankDescriptor().pcksize = Detail::size64 | static_cast<std::uint32_t>(data.size());
             Kvasir::Hal::handToHardware();
             apply(set(ReadySet{}));
@@ -308,7 +309,7 @@ public:
         static bool armReceive(std::size_t) {
             static_assert(!isIn, "armReceive is the OUT side");
             if(withController() || completionPending()) { return false; }
-            bankDescriptor().addr = reinterpret_cast<std::uint32_t>(buffer.data());
+            bankDescriptor().addr = Kvasir::busAddress(buffer.data());
             bankDescriptor().pcksize
               = Detail::size64
               | (static_cast<std::uint32_t>(maxPacketSize) << Detail::multiPacketPos);
@@ -337,7 +338,7 @@ public:
             {
                 return false;
             }
-            bankDescriptor().addr = reinterpret_cast<std::uint32_t>(dest.data());
+            bankDescriptor().addr = Kvasir::busAddress(dest.data());
             bankDescriptor().pcksize
               = Detail::size64
               | (static_cast<std::uint32_t>(dest.size()) << Detail::multiPacketPos);
@@ -572,7 +573,7 @@ public:
         }
         Kvasir::Hal::handToHardware();
         apply(write(Regs::DESCADD::descadd,
-                    reinterpret_cast<std::uint32_t>(std::addressof(Detail::descriptorTable[0]))));
+                    Kvasir::busAddress(std::addressof(Detail::descriptorTable[0]))));
 
         apply(write(Regs::CTRLB::SPDCONFValC::fs));
         if constexpr(CfgTraits::useSof) {
@@ -619,7 +620,7 @@ public:
         std::uint32_t const enabled = apply(read(Regs::CTRLA::enable));
         check(enabled != 0, "the module is enabled", "Usb is not in the Startup list?");
         std::uint32_t const table = apply(read(Regs::DESCADD::descadd));
-        check(table == reinterpret_cast<std::uint32_t>(std::addressof(Detail::descriptorTable[0])),
+        check(table == Kvasir::busAddress(std::addressof(Detail::descriptorTable[0])),
               "DESCADD points at the endpoint descriptor table",
               "prepare() did not get that far");
         std::uint32_t const detached = apply(read(Regs::CTRLB::detach));

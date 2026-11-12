@@ -7,13 +7,17 @@
 //
 //     Dma::rd<Channel>() = DMAC::DmacDescriptor{{.srcInc = DMAC::DmacDescriptor::srcinc::increment,
 //                                                .count  = n,
-//                                                .src    = reinterpret_cast<std::uint32_t>(buffer + n),
+//                                                .src    = buffer + n,
 //                                                .dst    = Regs::DATA8::Addr::value}};
 //
-// An incrementing address points past the block's end (D21 20.10.3, 20.10.4).
+// An incrementing address points past the block's end (D21 20.10.3, 20.10.4): pastEnd(block). Either address is a
+// register's (`Regs::X::Addr::value`) or memory (a pointer): Kvasir::BusAddress takes both, here and in setSource /
+// setDestination, which change one address of a descriptor that is otherwise set up.
 #include "kvasir/Hal/DmaHandoff.hpp"
+#include "kvasir/Util/BusAddress.hpp"
 
 #include <cstdint>
+#include <span>
 
 namespace Kvasir::DMAC {
 struct alignas(16) DmacDescriptor {
@@ -74,10 +78,10 @@ struct alignas(16) DmacDescriptor {
         Beatsize      beatSize = Beatsize::byte;
         Blockact      blockAct = Blockact::noact;
         Evosel        evOutput = Evosel::disabled;
-        std::uint16_t count    = 0;   // BTCNT: beats
-        std::uint32_t src      = 0;   // SRCADDR
-        std::uint32_t dst      = 0;   // DSTADDR
-        std::uint32_t next     = 0;   // DESCADDR: 0 = the last block
+        std::uint16_t count    = 0;    // BTCNT: beats
+        BusAddress    src      = {};   // SRCADDR
+        BusAddress    dst      = {};   // DSTADDR
+        BusAddress    next     = {};   // DESCADDR: 0 = the last block
     };
 
     [[nodiscard,
@@ -97,9 +101,24 @@ struct alignas(16) DmacDescriptor {
     [[gnu::always_inline]] constexpr explicit DmacDescriptor(Transfer const& t)
       : btctrl{btctrlOf(t)}
       , btcnt{t.count}
-      , srcaddr{t.src}
-      , dstaddr{t.dst}
-      , descaddr{t.next} {}
+      , srcaddr{t.src.value}
+      , dstaddr{t.dst.value}
+      , descaddr{t.next.value} {}
+
+    // The address of a side that increments over `block`: past its last beat (D21 20.10.3, 20.10.4).
+    template<typename T,
+             std::size_t N>
+    [[nodiscard,
+      gnu::always_inline]] static BusAddress
+    pastEnd(std::span<T,
+                      N> block) {
+        return block.data() + block.size();
+    }
+
+    // SRCADDR / DSTADDR alone, the rest of the descriptor as it is (the next block of a transfer set up once)
+    [[gnu::always_inline]] constexpr void setSource(BusAddress a) { srcaddr = a.value; }
+
+    [[gnu::always_inline]] constexpr void setDestination(BusAddress a) { dstaddr = a.value; }
 
     // BTCTRL.VALID of a write-back descriptor, which the DMAC writes while the channel runs: one load each call
     // (a caller polls it), Kvasir/Hal/DmaHandoff.hpp

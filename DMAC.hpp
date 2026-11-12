@@ -9,6 +9,7 @@
 #include "kvasir/Hal/Owns.hpp"
 #include "kvasir/Register/Register.hpp"
 #include "kvasir/Register/Utility.hpp"
+#include "kvasir/Util/BusAddress.hpp"
 #include "peripherals/DMAC.hpp"
 
 #include <array>
@@ -153,9 +154,8 @@ namespace Kvasir { namespace DMAC {
         }
 
         [[gnu::always_inline]] static void runtimeInit() {
-            apply(
-              write(Regs::BASEADDR::baseaddr, reinterpret_cast<std::uint32_t>(rdescriptors.data())),
-              write(Regs::WRBADDR::wrbaddr, reinterpret_cast<std::uint32_t>(wdescriptors.data())));
+            apply(write(Regs::BASEADDR::baseaddr, Kvasir::busAddress(rdescriptors.data())),
+                  write(Regs::WRBADDR::wrbaddr, Kvasir::busAddress(wdescriptors.data())));
             apply(Regs::CTRL::overrideDefaults(set(Regs::CTRL::dmaenable),
                                                set(Regs::CTRL::lvlen0),
                                                set(Regs::CTRL::lvlen1),

@@ -391,7 +391,7 @@ namespace Kvasir { namespace Sercom { namespace Usart {
                .srcInc  = DMAC::DmacDescriptor::Srcinc::increment,
                .count   = std::uint16_t(std::distance(first, last)),
                // to_address: a container's iterator need not be a pointer
-               .src = reinterpret_cast<std::uint32_t>(std::to_address(last)),
+               .src = std::to_address(last),
                .dst = Regs::DATA8::Addr::value}
             };
             startDma(static_cast<std::size_t>(std::distance(first, last)));

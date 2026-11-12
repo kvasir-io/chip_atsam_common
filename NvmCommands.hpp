@@ -15,6 +15,7 @@
 #include "chip/atsam_common/NvmResult.hpp"
 #include "kvasir/Register/Register.hpp"
 #include "kvasir/Register/Utility.hpp"
+#include "kvasir/Util/BusAddress.hpp"
 
 #include <cstdint>
 
@@ -74,11 +75,10 @@ namespace Kvasir { namespace Sam {
         }
 
         // ADDR is a half-word address, 22 bits (D21 22.8.8, C21 27.8.8)
-        template<typename T>
-        static void setAddr(T addr) {
-            apply(write(NVM::ADDR::addr,
-                        (reinterpret_cast<std::uint32_t>(addr) / 2)
-                          & Kvasir::Register::maskFromRange(21, 0)));
+        // a row or page by its address (an integer) or by the object that lies there (a pointer)
+        static void setAddr(Kvasir::BusAddress addr) {
+            apply(
+              write(NVM::ADDR::addr, (addr.value / 2) & Kvasir::Register::maskFromRange(21, 0)));
         }
 
         // Is [addr, addr + bytes) in the main array (mainArray) or the RWWEE array? PARAM's NVMP, PSZ and RWWEEP,
