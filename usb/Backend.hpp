@@ -458,8 +458,11 @@ private:
             if(get<2>(flags) != 0) {
                 // The 8 bytes are in endpoint 0's OUT buffer, and the next SETUP is only taken
                 // once this flag is clear (32.6.2.6) - so the packet is read first.
-                SetupPacket pkt;
-                std::memcpy(std::addressof(pkt), Ep0Out::buffer.data(), sizeof(pkt));
+                // Copied out as bytes; the packet is their value ([bit.cast]) - the module wrote them, they
+                // never were a SetupPacket.
+                std::array<std::byte, sizeof(SetupPacket)> raw;
+                std::memcpy(raw.data(), Ep0Out::buffer.data(), raw.size());
+                auto const pkt = std::bit_cast<SetupPacket>(raw);
                 apply(reset(E::EPINTFLAG::rxstp));
                 Sink::setup(pkt);
             }

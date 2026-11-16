@@ -17,6 +17,7 @@ static_assert(
 #include "chip/atsam_common/Io.hpp"
 #include "core/Nvic.hpp"
 #include "kvasir/Hal/Clocks.hpp"
+#include "kvasir/Hal/DmaHandoff.hpp"
 #include "kvasir/Hal/Owns.hpp"
 #include "kvasir/Register/Register.hpp"
 #include "kvasir/Util/BusAddress.hpp"
@@ -270,7 +271,10 @@ namespace Kvasir { namespace CAN {
         static bool send(CanMessage const& msg) {
             auto const state = apply(read(Regs::TXFQS::tfqpi), read(Regs::TXFQS::tffl));
             if(get<1>(state) == 0) { return false; }
+            // The element at the put index is written, then the add request hands it to the controller (SAM C20/C21
+            // data sheet 34.6.6.3): the plain store must not move behind the register write.
             txFIFO[get<0>(state)] = msg;
+            Kvasir::Hal::handToHardware();
             apply(write(Regs::TXBAR::ar, 1_u32 << get<0>(state)));
             return true;
         }
@@ -280,6 +284,9 @@ namespace Kvasir { namespace CAN {
             auto const state = apply(read(Regs::RXF0S::f0gi), read(Regs::RXF0S::f0fl));
             if(get<1>(state) == 0) { return ret; }
 
+            // The controller wrote the element at the get index before the fill level said so, and keeps it until
+            // the acknowledge (34.6.5.2): the plain load must not move before the status read.
+            Kvasir::Hal::takeFromHardware();
             ret = rxFIFO[get<0>(state)];
 
             apply(write(Regs::RXF0A::f0ai, get<0>(state)));

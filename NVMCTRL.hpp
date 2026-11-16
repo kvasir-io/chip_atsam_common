@@ -23,6 +23,7 @@
 #include "kvasir/Register/Wait.hpp"
 #include "kvasir/Runtime/Store.hpp"
 #include "kvasir/Util/BusAddress.hpp"
+#include "kvasir/Util/PaddingFree.hpp"
 #include "kvasir/Util/attributes.hpp"
 #include "peripherals/NVMCTRL.hpp"
 
@@ -256,6 +257,13 @@ namespace Nvm {
             static_assert(A == Array::main || Sam::Package::Nvm::hasRwweeArray,
                           "this SAM part has no RWWEE array: put the store on Nvm::Array::main");
 
+            // the CRC runs over v's bytes, and the value is copied member by member on its way into the page: a
+            // padding byte need not make that trip, and the record would fail its own CRC after it
+            static_assert(
+              Kvasir::PaddingFree<T>,
+              "a stored value has no padding: its CRC runs over its bytes - name the padding "
+              "(kvasir/Util/PaddingFree.hpp)");
+
             struct ValueStruct {
                 T             v{};
                 std::uint16_t crc{};
@@ -326,6 +334,9 @@ namespace Nvm {
             static_assert(std::alignment_of_v<RowStruct> == PageSize * PagesPerRow,
                           "a row struct is aligned to a row");
 
+            // Read as the plain object it is: every NVM command is a register write, and the compiler has to
+            // assume a store through such an address changes these rows (their address is out, as an integer) -
+            // so what is read after a command is the flash.
             [[KVASIR_SECTION_MEMBER(
               ".eeprom")]] static inline std::array<RowStruct, RowCount> rows{};
 
@@ -505,6 +516,12 @@ namespace Nvm {
                 std::uint32_t sequence{};   ///< counts the writes; erased flash reads 0xffffffff
                 T             v{};
             };
+
+            // the CRC runs over the payload's bytes: none of them is padding, in T or between the sequence and T
+            static_assert(Kvasir::PaddingFree<Payload>,
+                          "a journal's payload (a 32-bit sequence, then T) has no padding: its CRC "
+                          "runs over its "
+                          "bytes - name the padding (kvasir/Util/PaddingFree.hpp)");
 
             struct alignas(PageSize) Record {
                 Payload       payload{};

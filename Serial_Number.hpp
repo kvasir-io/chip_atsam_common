@@ -14,7 +14,8 @@ namespace Kvasir {
 // copied in memory byte order. Memory::loadPlain: an aligned, non-volatile load as the cast and memcpy before it
 // (Memory::load, a volatile access, made an E51 caller 80 B larger; loadBytes from an untyped address an
 // __aeabi_uread4 call on the M0+). Internal linkage as before: an `inline` one changed how LTO folds it into its
-// caller (E51 MainImpl +16 / -8 B).
+// caller (E51 MainImpl +16 / -8 B). Words into a std::array<std::uint32_t, 4> and std::bit_cast'ing that out: the
+// array lands on the stack and a memcpy call copies it to the result (E51 ID::operator() 24 -> 40 B, clang -Os).
 static inline std::array<std::byte,
                          16>
 serialNumber() {
